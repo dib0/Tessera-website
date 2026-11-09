@@ -1,0 +1,5 @@
+# The Tessera compiler rejects carriage returns, so sources must keep Unix line endings on every platform.
+*.tes text eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf
+docker/* text eol=lf

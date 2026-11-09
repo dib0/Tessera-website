@@ -1,0 +1,44 @@
+# The Tessera website: nginx + the Tessera module + the site (written in Tessera) + SQLite.
+#
+#   cp .env.example .env     # then choose ADMIN_USER and ADMIN_PASSWORD
+#   docker compose up -d --build
+#
+# Site:  http://localhost:8080/      Admin (statistics):  http://localhost:8080/admin
+
+services:
+  site:
+    build:
+      context: .
+      additional_contexts:
+        # The Tessera language repository. Use a local checkout with TESSERA_SRC=../Tessera-language
+        tessera: ${TESSERA_SRC:-https://github.com/dib0/Tessera-language.git}
+    # With IMAGE=ghcr.io/dib0/tessera-website:latest, `docker compose pull && docker compose up -d` runs the published image.
+    image: ${IMAGE:-tessera-website}
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      # The credentials of the admin page. Without both, the admin page is disabled.
+      ADMIN_USER: ${ADMIN_USER:?set ADMIN_USER in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+    volumes:
+      # Persistent storage: the SQLite database (site.db) lives in this folder on the host.
+      # For a named Docker volume use "site-data:/data" and uncomment the volumes section below.
+      - ${DATA_DIR:-./data}:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      # nginx starts as root, hands the data folder to the worker user and then drops to that user.
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+
+# volumes:
+#   site-data:
