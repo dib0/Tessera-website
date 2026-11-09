@@ -1,0 +1,67 @@
+name: Build and publish the Docker image
+
+# On every push to main (and on version tags) the image is built and pushed to
+# ghcr.io/dib0/tessera-website. On pull requests it is only built, to catch compile errors early.
+# The image build itself runs `tessera1 check` and `tessera1 test` on the site.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tessera_ref:
+        description: "Branch, tag or commit of dib0/Tessera-language to build with"
+        default: "main"
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/tessera-website
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image name and tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build (and push, except for pull requests)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # The Tessera language repository is the named build context `tessera` (see the Dockerfile).
+          build-contexts: |
+            tessera=https://github.com/${{ github.repository_owner }}/Tessera-language.git#${{ inputs.tessera_ref || 'main' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
