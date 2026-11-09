@@ -9,8 +9,6 @@ import model uses nothing
 import store uses db, env, random
 import view uses nothing
 import tracking uses nothing
-import style uses nothing
-import logo uses nothing
 import admin uses db, env, log, random, time
 
 fn slug_of(path: Text) -> Text {
@@ -25,22 +23,6 @@ if ends_with(trimmed, "/") {
 set trimmed = slice_text(trimmed, 0, length(trimmed) - 1)
 }
 trimmed
-}
-
-fn cached(answer: http.Response) -> http.Response = http.with_header(answer, "cache-control", "public, max-age=3600")
-
-note "The stylesheet and the logos are part of the program, so they are served without touching the database."
-fn asset(path: Text) -> http.Response {
-if path == "/assets/site.css" {
-return cached(http.response(200, "text/css; charset=utf-8", style.css()))
-}
-if path == "/assets/mark.svg" {
-return cached(http.response(200, "image/svg+xml", logo.mark()))
-}
-if path == "/assets/logo.svg" {
-return cached(http.response(200, "image/svg+xml", logo.full()))
-}
-http.not_found()
 }
 
 note "Counts one page view. See tracking.tes for what is, and is not, remembered."
@@ -80,9 +62,6 @@ return http.with_header(http.text(405, "method not allowed\n"), "allow", "GET, H
 if path == "/robots.txt" {
 return http.text(200, "User-agent: *\nDisallow: /admin\n")
 }
-if starts_with(path, "/assets/") {
-return asset(path)
-}
 let slug = slug_of(path)
 if slug == "home" and path != "/" {
 return http.redirect("/")
@@ -111,11 +90,6 @@ assert(answer.status == 200)
 test "only GET and HEAD are allowed" {
 let answer = handle(http.request("POST", "/", ""))
 assert(answer.status == 405)
-}
-
-test "assets are served from the program" {
-assert(handle(http.request("GET", "/assets/site.css", "")).status == 200)
-assert(handle(http.request("GET", "/assets/nothing.css", "")).status == 404)
 }
 
 test "paths map to page slugs" {

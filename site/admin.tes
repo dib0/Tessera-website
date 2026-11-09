@@ -80,7 +80,7 @@ let top_referrers = count_table("Referrers, last 30 days", "Host", data.referrer
 let top_browsers = count_table("Browsers, last 30 days", "Browser", data.browsers)
 let not_found = count_table("Not found, last 30 days", "Path", data.missing)
 let intro = "\(html.escape(since)) A visitor is counted once per day. Bots are left out of these numbers; \(data.bot_views) bot views were recorded."
-let inner = "<header class='site'><div class='wrap bar'><a class='brand' href='/'><img src='/assets/mark.svg' alt='' width='34' height='34'><span>Tessera admin</span></a><nav aria-label='Admin'><a href='/' >View site</a></nav></div></header><main id='main'><section class='block'><div class='wrap'><h1>Statistics</h1><p class='intro'>\(intro)</p><div class='stats'>\(tiles)</div><h2>Views per day</h2>\(chart(data.days))</div></section><section class='block'><div class='wrap'><div class='grid2'>\(top_pages)\(top_referrers)\(top_browsers)\(not_found)</div></div></section></main>"
+let inner = "<header class='site'><div class='wrap bar'><a class='brand' href='/'><img src='/assets/img/mark.svg' alt='' width='38' height='38'><span>Tessera admin</span></a><nav class='main' aria-label='Admin'><a href='/'>View site</a></nav></div></header><main id='main'><section class='block'><div class='wrap'><h1>Statistics</h1><p class='intro'>\(intro)</p><div class='stats'>\(tiles)</div><h2>Views per day</h2>\(chart(data.days))</div></section><section class='block'><div class='wrap'><div class='grid2'>\(top_pages)\(top_referrers)\(top_browsers)\(not_found)</div></div></section></main>"
 view.shell(site, "Statistics · Tessera admin", "Site statistics", "noindex, nofollow", inner)
 }
 

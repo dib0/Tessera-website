@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240" aria-hidden="true">
+  <defs>
+    <pattern id="p" width="80" height="80" patternUnits="userSpaceOnUse">
+      <path d="M6 0H64L70 6V64L64 70H6L0 64V6Z" transform="translate(5 5)" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    </pattern>
+  </defs>
+  <g fill-opacity=".9">
+    <path d="M10 10H68L74 16V74L68 80H10L4 74V16Z" fill="#4C7DFF" opacity=".10"/>
+    <path d="M90 10H148L154 16V74L148 80H90L84 74V16Z" fill="#50E5D0" opacity=".10"/>
+    <path d="M170 10H228L234 16V74L228 80H170L164 74V16Z" fill="#FFE39A" opacity=".16"/>
+    <path d="M90 90H148L154 96V154L148 160H90L84 154V96Z" fill="#71C9FF" opacity=".10"/>
+    <path d="M90 170H148L154 176V234L148 240H90L84 234V176Z" fill="#8A75FF" opacity=".10"/>
+    <path d="M10 90H68L74 96V154L68 160H10L4 154V96Z" fill="none" stroke="#4C7DFF" stroke-opacity=".14"/>
+    <path d="M170 90H228L234 96V154L228 160H170L164 154V96Z" fill="none" stroke="#50E5D0" stroke-opacity=".16"/>
+    <path d="M10 170H68L74 176V234L68 240H10L4 234V176Z" fill="none" stroke="#D99A45" stroke-opacity=".2"/>
+    <path d="M170 170H228L234 176V234L228 240H170L164 234V176Z" fill="none" stroke="#8A75FF" stroke-opacity=".14"/>
+  </g>
+</svg>

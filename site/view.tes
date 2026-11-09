@@ -6,7 +6,6 @@
 
 import std/html
 import model uses nothing
-import style uses nothing
 
 fn setting(site: Map[Text, Text], name: Text, fallback: Text) -> Text = value_or(get(site, name), fallback)
 
@@ -103,7 +102,7 @@ set parts += [button(rows[index], index == 0)]
 
 fn intro(body: Text) -> Text = if body == "" { "" } else { "<p class='intro'>\(inline(body))</p>" }
 
-fn tiles() -> Text = "<div class='tiles' aria-hidden='true'><i></i><i></i><i></i><i></i><i></i></div>"
+fn tiles() -> Text = "<div class='tiles' aria-hidden='true'><i class='facet t1'></i><i class='facet t2'></i><i class='facet t3'></i><i class='facet t4'></i><i class='facet t5'></i></div>"
 
 fn hero_block(item: model.Block) -> Text {
 let title = inline(item.heading)
@@ -119,7 +118,7 @@ let lead = inline(item.body)
 
 fn section_block(item: model.Block) -> Text {
 let title = heading_html("h2", item.heading)
-"<section class='block'><div class='wrap narrow'>\(title)\(paragraphs(item.body))</div></section>"
+"<section class='block reveal'><div class='wrap narrow'>\(title)\(paragraphs(item.body))</div></section>"
 }
 
 fn card(row: Text, index: Int) -> Text {
@@ -142,7 +141,7 @@ for index in range(0, length(rows)) {
 set parts += [card(rows[index], index)]
 }
 let title = heading_html("h2", item.heading)
-"<section class='block'><div class='wrap'>\(title)\(intro(item.body))<div class='cards'>\(join(parts, "\n"))</div></div></section>"
+"<section class='block reveal'><div class='wrap'>\(title)\(intro(item.body))<div class='cards'>\(join(parts, "\n"))</div></div></section>"
 }
 
 fn step(row: Text) -> Text {
@@ -152,25 +151,25 @@ let cells = cells_of(row)
 
 fn steps_block(item: model.Block) -> Text {
 let title = heading_html("h2", item.heading)
-"<section class='block'><div class='wrap narrow'>\(title)\(intro(item.body))<ol class='steps'>\(join(map(rows_of(item.extra), step), "\n"))</ol></div></section>"
+"<section class='block reveal'><div class='wrap narrow'>\(title)\(intro(item.body))<ol class='steps'>\(join(map(rows_of(item.extra), step), "\n"))</ol></div></section>"
 }
 
 fn tick(row: Text) -> Text = "<li>\(inline(row))</li>"
 
 fn list_block(item: model.Block) -> Text {
 let title = heading_html("h2", item.heading)
-"<section class='block'><div class='wrap narrow'>\(title)\(intro(item.body))<ul class='ticks'>\(join(map(rows_of(item.extra), tick), "\n"))</ul></div></section>"
+"<section class='block reveal'><div class='wrap narrow'>\(title)\(intro(item.body))<ul class='ticks'>\(join(map(rows_of(item.extra), tick), "\n"))</ul></div></section>"
 }
 
 fn code_block(item: model.Block) -> Text {
 let title = heading_html("h2", item.heading)
 let caption = if item.extra == "" { "" } else { "<figcaption>\(html.escape(item.extra))</figcaption>" }
-"<section class='block'><div class='wrap narrow'>\(title)<figure class='code'>\(caption)<pre><code>\(html.escape(item.body))</code></pre></figure></div></section>"
+"<section class='block reveal'><div class='wrap narrow'>\(title)<figure class='code'>\(caption)<pre><code>\(html.escape(item.body))</code></pre></figure></div></section>"
 }
 
 fn callout_block(item: model.Block) -> Text {
 let title = if item.heading == "" { "" } else { "<strong>\(inline(item.heading))</strong>" }
-"<section class='block'><div class='wrap narrow'><aside class='callout'>\(title)\(paragraphs(item.body))</aside></div></section>"
+"<section class='block reveal'><div class='wrap narrow'><aside class='callout'>\(title)\(paragraphs(item.body))</aside></div></section>"
 }
 
 fn cta_block(item: model.Block) -> Text {
@@ -195,9 +194,6 @@ _ => ""
 
 // ---------- the page around the blocks ----------
 
-note "A version for the stylesheet URL, so browsers fetch a new stylesheet when the program ships one."
-fn style_version() -> Text = slice_text(hex_encode(sha256(to_bytes(style.css()))), 0, 10)
-
 fn nav_link(entry: model.Page, current_slug: Text) -> Text {
 let mark = if entry.slug == current_slug { " aria-current='page'" } else { "" }
 "<a href='\(page_url(entry.slug))'\(mark)>\(html.escape(entry.nav_label))</a>"
@@ -210,7 +206,7 @@ set links += [nav_link(entry, current_slug)]
 }
 let name = html.escape(setting(site, "site_name", "Tessera"))
 let github = html.escape(setting(site, "github_url", "https://github.com/dib0/Tessera-language"))
-"<a class='skip' href='#main'>Skip to content</a><header class='site'><div class='wrap bar'><a class='brand' href='/'><img src='/assets/mark.svg' alt='' width='34' height='34'><span>\(name)</span></a><nav aria-label='Main'>\(join(links, ""))<a class='gh' href='\(github)' rel='noopener'>GitHub</a></nav></div></header>"
+"<a class='skip' href='#main'>Skip to content</a><header class='site'><div class='wrap bar'><a class='brand' href='/'><img src='/assets/img/mark.svg' alt='' width='38' height='38'><span>\(name)</span></a><nav class='main' aria-label='Main'>\(join(links, ""))<a class='gh' href='\(github)' rel='noopener'>GitHub</a></nav></div></header>"
 }
 
 fn footer_html(site: Map[Text, Text]) -> Text {
@@ -222,13 +218,13 @@ if safe_target(wanted) {
 set links += [anchor(html.escape(cell(cells, 0)), html.escape(wanted))]
 }
 }
-"<footer class='site'><div class='wrap'><p>\(inline(setting(site, "footer_text", "")))</p><p>\(join(links, " · "))</p></div></footer>"
+"<div class='strip' aria-hidden='true'><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><footer class='site'><div class='wrap'><img src='/assets/img/mark.svg' alt='' width='54' height='54'><div><p>\(inline(setting(site, "footer_text", "")))</p><p class='links'>\(join(links, ""))</p></div></div></footer>"
 }
 
 note "A complete HTML document around `inner`. Used for the pages and for the admin page."
 pub fn shell(site: Map[Text, Text], title: Text, description: Text, robots: Text, inner: Text) -> Text {
 let language = html.escape(setting(site, "language", "en"))
-let head = "<meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><meta name='robots' content='\(html.escape(robots))'><title>\(html.escape(title))</title><meta name='description' content='\(html.escape(description))'><link rel='icon' type='image/svg+xml' href='/assets/mark.svg'><link rel='stylesheet' href='/assets/site.css?v=\(style_version())'>"
+let head = "<meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><meta name='robots' content='\(html.escape(robots))'><title>\(html.escape(title))</title><meta name='description' content='\(html.escape(description))'><link rel='icon' type='image/svg+xml' href='/assets/img/mark.svg'><link rel='stylesheet' href='/assets/css/site.css'><script src='/assets/js/theme.js'></script><script src='/assets/js/site.js' defer></script>"
 "<!doctype html>\n<html lang='\(language)'>\n<head>\n\(head)\n</head>\n<body>\n\(inner)\n</body>\n</html>\n"
 }
 
