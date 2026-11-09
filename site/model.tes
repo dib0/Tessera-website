@@ -1,0 +1,26 @@
+// The types the other modules share. Pure, so any module may import it with `uses nothing`.
+
+pub type Page {
+slug: Text
+title: Text
+description: Text
+nav_label: Text
+nav_order: Int
+}
+
+pub type Block {
+kind: Text
+heading: Text
+body: Text
+extra: Text
+}
+
+pub type Setting {
+name: Text
+value: Text
+}
+
+pub type SeedPage {
+page: Page
+blocks: List[Block]
+}

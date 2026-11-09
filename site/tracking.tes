@@ -1,0 +1,63 @@
+// What the site remembers about a visit. Pure and testable: an address is never stored,
+// only a hash that is salted per installation and changes every day.
+
+note "The UTC day (YYYY-MM-DD) of a time in milliseconds since 1970."
+pub fn day_of(moment: Int) -> Text = slice_text(format_time(moment), 0, 10)
+
+note "The day `days` days before `moment`; used for the date windows of the admin page."
+pub fn days_before(moment: Int, days: Int) -> Text = day_of(moment - days * 86400000)
+
+pub fn clip(text: Text, limit: Int) -> Text = if length(text) > limit { slice_text(text, 0, limit) } else { text }
+
+note "The first address of an X-Forwarded-For header, else the connection address. Clients can fake the header; that only skews the statistics."
+pub fn first_address(forwarded: Text, remote: Text) -> Text {
+let first = trim(split(forwarded, ",")[0])
+if first == "" { remote } else { first }
+}
+
+note "An anonymous visitor id: the same visitor gets the same id for one day, and a different one tomorrow. The address cannot be recovered from it."
+pub fn visitor_id(salt: Text, day: Text, address: Text, agent: Text) -> Text {
+slice_text(hex_encode(sha256(to_bytes("\(salt)|\(day)|\(address)|\(agent)"))), 0, 16)
+}
+
+pub fn is_bot(agent: Text) -> Bool {
+let lower = to_lower(agent)
+if lower == "" {
+return true
+}
+for marker in ["bot", "crawl", "spider", "slurp", "curl/", "wget", "python-requests", "headless", "monitor", "uptime", "preview", "fetch"] {
+if contains(lower, marker) {
+return true
+}
+}
+false
+}
+
+note "A coarse browser family. Only this word is stored, never the full user agent."
+pub fn agent_family(agent: Text) -> Text {
+if is_bot(agent) {
+return "Bot"
+}
+let lower = to_lower(agent)
+if contains(lower, "edg/") {
+return "Edge"
+}
+if contains(lower, "firefox/") {
+return "Firefox"
+}
+if contains(lower, "chrome/") or contains(lower, "chromium/") {
+return "Chrome"
+}
+if contains(lower, "safari/") {
+return "Safari"
+}
+"Other"
+}
+
+note "Only the host of a Referer header is kept, never the path or query."
+pub fn referrer_host(referer: Text) -> Text {
+let marker = index_of(referer, "://") else return ""
+let rest = slice_text(referer, marker + 3, length(referer))
+let stop = value_or(index_of(rest, "/"), length(rest))
+clip(to_lower(slice_text(rest, 0, stop)), 80)
+}

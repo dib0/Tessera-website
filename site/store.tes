@@ -1,0 +1,135 @@
+// The SQLite side of the site: the schema, the first-run seeding and the queries behind the pages.
+//
+// The database holds the texts and the page structure (settings, pages, blocks) and the statistics (hits).
+// When the database is empty, `open` fills it from `content`; from then on the database is the only source.
+
+import model uses nothing
+import content uses nothing
+import tracking uses nothing
+
+note "The SQLite file: SITE_DB, relative to TESSERA_FS_ROOT when that is set (the Docker image sets both, so the file lands in the mounted data folder)."
+fn database_path() -> Text uses env {
+let configured = environment_variable("SITE_DB")
+if configured == "" {
+return "site.db"
+}
+configured
+}
+
+fn schema() -> List[Text] {
+[
+"CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)",
+"CREATE TABLE IF NOT EXISTS pages (slug TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', nav_label TEXT NOT NULL DEFAULT '', nav_order INTEGER NOT NULL DEFAULT 0, published INTEGER NOT NULL DEFAULT 1)",
+"CREATE TABLE IF NOT EXISTS blocks (id INTEGER PRIMARY KEY, page_slug TEXT NOT NULL, sort_order INTEGER NOT NULL, kind TEXT NOT NULL, heading TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', extra TEXT NOT NULL DEFAULT '', UNIQUE (page_slug, sort_order))",
+"CREATE TABLE IF NOT EXISTS hits (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, day TEXT NOT NULL, path TEXT NOT NULL, status INTEGER NOT NULL, visitor TEXT NOT NULL, referrer TEXT NOT NULL DEFAULT '', agent TEXT NOT NULL DEFAULT '', bot INTEGER NOT NULL DEFAULT 0)",
+"CREATE INDEX IF NOT EXISTS hits_by_day ON hits (day)"
+]
+}
+
+fn text_of(row: Map[Text, Text], name: Text) -> Text = value_or(get(row, name), "")
+
+fn count_of(rows: List[Map[Text, Text]], name: Text) -> Int {
+if length(rows) == 0 {
+return 0
+}
+value_or(parse_int(text_of(rows[0], name)), 0)
+}
+
+note "Opens the database and makes sure it is ready: on a new or empty database the tables are created and the initial content is written, in one transaction. Workers that start at the same moment wait for each other, and the second one finds the work done."
+pub fn open() -> Result[Database, Text] uses db, env, random {
+let connection = try db_open(database_path())
+let rows = try db_query(connection, "PRAGMA user_version", [])
+if count_of(rows, "user_version") < 1 {
+try prepare(connection)
+}
+.Ok(connection)
+}
+
+fn prepare(connection: Database) -> Result[Unit, Text] uses db, random {
+let _ = try db_execute(connection, "BEGIN IMMEDIATE", [])
+let outcome = build(connection)
+match outcome {
+.Ok(_) => {}
+.Error(message) => {
+let _ = db_execute(connection, "ROLLBACK", [])
+return .Error(message)
+}
+}
+let _ = try db_execute(connection, "COMMIT", [])
+.Ok(())
+}
+
+fn build(connection: Database) -> Result[Unit, Text] uses db, random {
+for statement in schema() {
+let _ = try db_execute(connection, statement, [])
+}
+let existing = try db_query(connection, "SELECT COUNT(*) AS n FROM pages", [])
+if count_of(existing, "n") == 0 {
+try seed(connection)
+}
+let salt = hex_encode(random_bytes(16))
+let _ = try db_execute(connection, "INSERT OR IGNORE INTO settings (name, value) VALUES ('stats_salt', ?1)", [salt])
+let _ = try db_execute(connection, "PRAGMA user_version = 1", [])
+.Ok(())
+}
+
+fn seed(connection: Database) -> Result[Unit, Text] uses db {
+for entry in content.settings() {
+let _ = try db_execute(connection, "INSERT OR IGNORE INTO settings (name, value) VALUES (?1, ?2)", [entry.name, entry.value])
+}
+for seeded in content.pages() {
+let details = seeded.page
+let _ = try db_execute(connection, "INSERT OR IGNORE INTO pages (slug, title, description, nav_label, nav_order) VALUES (?1, ?2, ?3, ?4, ?5)", [details.slug, details.title, details.description, details.nav_label, to_text(details.nav_order)])
+for index in range(0, length(seeded.blocks)) {
+let item = seeded.blocks[index]
+let _ = try db_execute(connection, "INSERT OR IGNORE INTO blocks (page_slug, sort_order, kind, heading, body, extra) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", [details.slug, to_text(index), item.kind, item.heading, item.body, item.extra])
+}
+}
+.Ok(())
+}
+
+// ---------- reading the site ----------
+
+fn page_from(row: Map[Text, Text]) -> model.Page {
+model.Page { slug: text_of(row, "slug"), title: text_of(row, "title"), description: text_of(row, "description"), nav_label: text_of(row, "nav_label"), nav_order: value_or(parse_int(text_of(row, "nav_order")), 0) }
+}
+
+fn block_from(row: Map[Text, Text]) -> model.Block {
+model.Block { kind: text_of(row, "kind"), heading: text_of(row, "heading"), body: text_of(row, "body"), extra: text_of(row, "extra") }
+}
+
+pub fn load_settings(connection: Database) -> Map[Text, Text] uses db {
+var found: Map[Text, Text] = [:]
+let rows = db_query(connection, "SELECT name, value FROM settings", []) else return found
+for row in rows {
+set found = put(found, text_of(row, "name"), text_of(row, "value"))
+}
+found
+}
+
+pub fn find_page(connection: Database, slug: Text) -> Option[model.Page] uses db {
+let rows = db_query(connection, "SELECT slug, title, description, nav_label, nav_order FROM pages WHERE slug = ?1 AND published = 1", [slug]) else return .None
+if length(rows) == 0 {
+return .None
+}
+.Some(page_from(rows[0]))
+}
+
+note "The pages that appear in the menu, in menu order. A page with nav_order 0 is reachable but not listed."
+pub fn navigation(connection: Database) -> List[model.Page] uses db {
+let rows = db_query(connection, "SELECT slug, title, description, nav_label, nav_order FROM pages WHERE published = 1 AND nav_order > 0 ORDER BY nav_order, slug", []) else return []
+map(rows, page_from)
+}
+
+pub fn page_blocks(connection: Database, slug: Text) -> List[model.Block] uses db {
+let rows = db_query(connection, "SELECT kind, heading, body, extra FROM blocks WHERE page_slug = ?1 ORDER BY sort_order", [slug]) else return []
+map(rows, block_from)
+}
+
+// ---------- statistics ----------
+
+note "Stores one page view. A failure to store is ignored on purpose: a statistics problem must never break a page."
+pub fn record_hit(connection: Database, moment: Int, path: Text, status: Int, visitor: Text, referrer: Text, agent: Text, bot: Bool) -> Unit uses db {
+let flag = if bot { "1" } else { "0" }
+let _ = db_execute(connection, "INSERT INTO hits (ts, day, path, status, visitor, referrer, agent, bot) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", [to_text(moment), tracking.day_of(moment), path, to_text(status), visitor, referrer, agent, flag])
+}

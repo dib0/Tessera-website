@@ -1,0 +1,170 @@
+// The website of the Tessera language, written in Tessera.
+//
+// A web application is a program with `handle` instead of `main`. It runs inside nginx (through the Tessera
+// module), as a built-in HTTP server (`serve`), as CGI or FastCGI. All texts and the page structure come from
+// SQLite (see store.tes); on an empty database they are seeded from content.tes.
+
+import std/http
+import model uses nothing
+import store uses db, env, random
+import view uses nothing
+import tracking uses nothing
+import style uses nothing
+import logo uses nothing
+import admin uses db, env, log, random, time
+
+fn slug_of(path: Text) -> Text {
+if path == "/" {
+return "home"
+}
+var trimmed = path
+if starts_with(trimmed, "/") {
+set trimmed = slice_text(trimmed, 1, length(trimmed))
+}
+if ends_with(trimmed, "/") {
+set trimmed = slice_text(trimmed, 0, length(trimmed) - 1)
+}
+trimmed
+}
+
+fn cached(answer: http.Response) -> http.Response = http.with_header(answer, "cache-control", "public, max-age=3600")
+
+note "The stylesheet and the logos are part of the program, so they are served without touching the database."
+fn asset(path: Text) -> http.Response {
+if path == "/assets/site.css" {
+return cached(http.response(200, "text/css; charset=utf-8", style.css()))
+}
+if path == "/assets/mark.svg" {
+return cached(http.response(200, "image/svg+xml", logo.mark()))
+}
+if path == "/assets/logo.svg" {
+return cached(http.response(200, "image/svg+xml", logo.full()))
+}
+http.not_found()
+}
+
+note "Counts one page view. See tracking.tes for what is, and is not, remembered."
+fn remember(connection: Database, site: Map[Text, Text], request: http.Request, status: Int) -> Unit uses db, time {
+if request.method == "GET" {
+let moment = now()
+let agent = value_or(http.header(request, "user-agent"), "")
+let forwarded = value_or(http.header(request, "x-forwarded-for"), "")
+let address = tracking.first_address(forwarded, request.remote_address)
+let own_host = to_lower(value_or(http.header(request, "host"), ""))
+let from_host = tracking.referrer_host(value_or(http.header(request, "referer"), ""))
+let referrer = if from_host == own_host { "" } else { from_host }
+let visitor = tracking.visitor_id(value_or(get(site, "stats_salt"), ""), tracking.day_of(moment), address, agent)
+store.record_hit(connection, moment, tracking.clip(request.path, 120), status, visitor, referrer, tracking.agent_family(agent), tracking.is_bot(agent))
+}
+}
+
+fn missing(connection: Database, site: Map[Text, Text], request: http.Request) -> http.Response uses db, time {
+remember(connection, site, request, 404)
+let current = store.find_page(connection, "404") else return http.text(404, "page not found\n")
+http.html(404, view.document(site, store.navigation(connection), current, store.page_blocks(connection, "404")))
+}
+
+fn unavailable() -> http.Response = http.text(503, "the site database is unavailable\n")
+
+fn handle(request: http.Request) -> http.Response uses db, env, log, random, time {
+let path = request.path
+if path == "/healthz" {
+return http.text(200, "ok\n")
+}
+if path == "/admin" or starts_with(path, "/admin/") {
+return admin.respond(request)
+}
+if request.method != "GET" and request.method != "HEAD" {
+return http.with_header(http.text(405, "method not allowed\n"), "allow", "GET, HEAD")
+}
+if path == "/robots.txt" {
+return http.text(200, "User-agent: *\nDisallow: /admin\n")
+}
+if starts_with(path, "/assets/") {
+return asset(path)
+}
+let slug = slug_of(path)
+if slug == "home" and path != "/" {
+return http.redirect("/")
+}
+let connection = store.open() else return unavailable()
+let site = store.load_settings(connection)
+let current = match store.find_page(connection, slug) {
+.Some(found) => found
+.None => return missing(connection, site, request)
+}
+if current.slug == "404" {
+return missing(connection, site, request)
+}
+remember(connection, site, request, 200)
+let items = store.page_blocks(connection, current.slug)
+http.html(200, view.document(site, store.navigation(connection), current, items))
+}
+
+// ---------- tests: `tessera1 test site/main.tes` ----------
+
+test "the health check answers without a database" {
+let answer = handle(http.request("GET", "/healthz", ""))
+assert(answer.status == 200)
+}
+
+test "only GET and HEAD are allowed" {
+let answer = handle(http.request("POST", "/", ""))
+assert(answer.status == 405)
+}
+
+test "assets are served from the program" {
+assert(handle(http.request("GET", "/assets/site.css", "")).status == 200)
+assert(handle(http.request("GET", "/assets/nothing.css", "")).status == 404)
+}
+
+test "paths map to page slugs" {
+assert(slug_of("/") == "home")
+assert(slug_of("/why") == "why")
+assert(slug_of("/why/") == "why")
+}
+
+test "a page is built from its blocks and everything from the database is escaped" {
+let details = model.Page { slug: "demo", title: "<b>Demo</b>", description: "a \"demo\"", nav_label: "Demo", nav_order: 1 }
+let items = [model.Block { kind: "section", heading: "A <i>heading</i>", body: "<script>alert(1)</script> and `code` and [a link](https://example.org/a?b=1&c=2)", extra: "" }]
+let output = view.document(["site_name": "Tessera"], [details], details, items)
+assert(not contains(output, "<script>"))
+assert(not contains(output, "<b>Demo"))
+assert(contains(output, "&lt;script&gt;"))
+assert(contains(output, "<code>code</code>"))
+assert(contains(output, "<a href='https://example.org/a?b=1&amp;c=2' rel='noopener'>a link</a>"))
+assert(contains(output, "aria-current='page'"))
+}
+
+test "links to other schemes stay plain text" {
+let details = model.Page { slug: "demo", title: "Demo", description: "", nav_label: "Demo", nav_order: 1 }
+let items = [model.Block { kind: "section", heading: "", body: "[click](javascript:alert(1))", extra: "" }]
+let output = view.document([:], [], details, items)
+assert(not contains(output, "href='javascript"))
+}
+
+test "a visitor id is stable for a day and changes the next day" {
+let today = tracking.visitor_id("salt", "2026-11-09", "203.0.113.7", "Firefox")
+assert(today == tracking.visitor_id("salt", "2026-11-09", "203.0.113.7", "Firefox"))
+assert(today != tracking.visitor_id("salt", "2026-11-10", "203.0.113.7", "Firefox"))
+assert(length(today) == 16)
+assert(not contains(today, "203.0.113.7"))
+}
+
+test "crawlers and tools are told apart from browsers" {
+assert(tracking.is_bot("Googlebot/2.1"))
+assert(tracking.is_bot(""))
+assert(not tracking.is_bot("Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"))
+assert(tracking.agent_family("Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/130.0 Safari/537.36 Edg/130.0") == "Edge")
+assert(tracking.agent_family("Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/130.0 Safari/537.36") == "Chrome")
+}
+
+test "only the host of a referrer is kept" {
+assert(tracking.referrer_host("https://News.Example.org/some/path?q=1") == "news.example.org")
+assert(tracking.referrer_host("not a url") == "")
+}
+
+test "days are counted back from a moment" {
+assert(tracking.day_of(0) == "1970-01-01")
+assert(tracking.days_before(86400000 * 10, 3) == "1970-01-08")
+}

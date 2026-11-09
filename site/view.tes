@@ -1,0 +1,244 @@
+// Turns a page and its blocks, as read from the database, into HTML. Pure: no effects.
+//
+// Everything that comes from the database is escaped before it is placed in HTML. The only markup a text can
+// produce is what this module writes itself: paragraphs, `code` spans and [label](url) links to http(s), mailto,
+// /path and #anchor targets.
+
+import std/html
+import model uses nothing
+import style uses nothing
+
+fn setting(site: Map[Text, Text], name: Text, fallback: Text) -> Text = value_or(get(site, name), fallback)
+
+pub fn page_url(slug: Text) -> Text = if slug == "home" { "/" } else { "/\(slug)" }
+
+fn not_blank(text: Text) -> Bool = length(text) > 0
+
+fn rows_of(text: Text) -> List[Text] = filter(map(split(text, "\n"), trim), not_blank)
+
+fn cells_of(row: Text) -> List[Text] = map(split(row, "|"), trim)
+
+fn cell(cells: List[Text], index: Int) -> Text = if index < length(cells) { cells[index] } else { "" }
+
+fn external(target: Text) -> Bool = starts_with(target, "http://") or starts_with(target, "https://")
+
+fn safe_target(target: Text) -> Bool = external(target) or starts_with(target, "/") or starts_with(target, "#") or starts_with(target, "mailto:")
+
+fn anchor(label: Text, target: Text) -> Text {
+if external(target) {
+return "<a href='\(target)' rel='noopener'>\(label)</a>"
+}
+"<a href='\(target)'>\(label)</a>"
+}
+
+// ---------- inline text ----------
+
+fn link_piece(piece: Text) -> Text {
+let close = index_of(piece, "](") else return "[" + piece
+let label = slice_text(piece, 0, close)
+let rest = slice_text(piece, close + 2, length(piece))
+let finish = index_of(rest, ")") else return "[" + piece
+let target = slice_text(rest, 0, finish)
+let tail = slice_text(rest, finish + 1, length(rest))
+if safe_target(target) {
+return anchor(label, target) + tail
+}
+"[" + piece
+}
+
+fn links(text: Text) -> Text {
+let parts = split(text, "[")
+var out = parts[0]
+for index in range(1, length(parts)) {
+set out += link_piece(parts[index])
+}
+out
+}
+
+note "Escapes the text, then turns `code` spans and [label](url) links into markup."
+fn inline(raw: Text) -> Text {
+let pieces = split(html.escape(raw), "`")
+var out = ""
+for index in range(0, length(pieces)) {
+if index % 2 == 1 and index < length(pieces) - 1 {
+set out += "<code>\(pieces[index])</code>"
+} else if index % 2 == 1 {
+set out += "`" + pieces[index]
+} else {
+set out += links(pieces[index])
+}
+}
+out
+}
+
+fn paragraph(text: Text) -> Text = "<p>\(inline(text))</p>"
+
+fn paragraphs(body: Text) -> Text = join(map(filter(map(split(body, "\n\n"), trim), not_blank), paragraph), "\n")
+
+fn heading_html(level: Text, heading: Text) -> Text = if heading == "" { "" } else { "<\(level)>\(inline(heading))</\(level)>" }
+
+// ---------- blocks ----------
+
+fn button(row: Text, primary: Bool) -> Text {
+let cells = cells_of(row)
+let label = html.escape(cell(cells, 0))
+let wanted = cell(cells, 1)
+let target = if safe_target(wanted) { html.escape(wanted) } else { "#" }
+let style_class = if primary { "btn primary" } else { "btn" }
+let rel = if external(target) { " rel='noopener'" } else { "" }
+"<a class='\(style_class)' href='\(target)'\(rel)>\(label)</a>"
+}
+
+fn buttons(extra: Text) -> Text {
+let rows = rows_of(extra)
+if length(rows) == 0 {
+return ""
+}
+var parts: List[Text] = []
+for index in range(0, length(rows)) {
+set parts += [button(rows[index], index == 0)]
+}
+"<p class='actions'>\(join(parts, " "))</p>"
+}
+
+fn intro(body: Text) -> Text = if body == "" { "" } else { "<p class='intro'>\(inline(body))</p>" }
+
+fn tiles() -> Text = "<div class='tiles' aria-hidden='true'><i></i><i></i><i></i><i></i><i></i></div>"
+
+fn hero_block(item: model.Block) -> Text {
+let title = inline(item.heading)
+let lead = inline(item.body)
+"<section class='hero'><div class='wrap hero-grid'><div><h1>\(title)</h1><p class='lead'>\(lead)</p>\(buttons(item.extra))</div>\(tiles())</div></section>"
+}
+
+fn banner_block(item: model.Block) -> Text {
+let title = inline(item.heading)
+let lead = inline(item.body)
+"<section class='banner'><div class='wrap'><h1>\(title)</h1><p class='lead'>\(lead)</p></div></section>"
+}
+
+fn section_block(item: model.Block) -> Text {
+let title = heading_html("h2", item.heading)
+"<section class='block'><div class='wrap narrow'>\(title)\(paragraphs(item.body))</div></section>"
+}
+
+fn card(row: Text, index: Int) -> Text {
+let cells = cells_of(row)
+let title = inline(cell(cells, 0))
+let text = inline(cell(cells, 1))
+let wanted = cell(cells, 2)
+var more = ""
+if wanted != "" and safe_target(wanted) {
+let link = anchor("Open", html.escape(wanted))
+set more = "<p class='more'>\(link)</p>"
+}
+"<article class='card t\(index % 5 + 1)'><h3>\(title)</h3><p>\(text)</p>\(more)</article>"
+}
+
+fn cards_block(item: model.Block) -> Text {
+let rows = rows_of(item.extra)
+var parts: List[Text] = []
+for index in range(0, length(rows)) {
+set parts += [card(rows[index], index)]
+}
+let title = heading_html("h2", item.heading)
+"<section class='block'><div class='wrap'>\(title)\(intro(item.body))<div class='cards'>\(join(parts, "\n"))</div></div></section>"
+}
+
+fn step(row: Text) -> Text {
+let cells = cells_of(row)
+"<li><h3>\(inline(cell(cells, 0)))</h3><p>\(inline(cell(cells, 1)))</p></li>"
+}
+
+fn steps_block(item: model.Block) -> Text {
+let title = heading_html("h2", item.heading)
+"<section class='block'><div class='wrap narrow'>\(title)\(intro(item.body))<ol class='steps'>\(join(map(rows_of(item.extra), step), "\n"))</ol></div></section>"
+}
+
+fn tick(row: Text) -> Text = "<li>\(inline(row))</li>"
+
+fn list_block(item: model.Block) -> Text {
+let title = heading_html("h2", item.heading)
+"<section class='block'><div class='wrap narrow'>\(title)\(intro(item.body))<ul class='ticks'>\(join(map(rows_of(item.extra), tick), "\n"))</ul></div></section>"
+}
+
+fn code_block(item: model.Block) -> Text {
+let title = heading_html("h2", item.heading)
+let caption = if item.extra == "" { "" } else { "<figcaption>\(html.escape(item.extra))</figcaption>" }
+"<section class='block'><div class='wrap narrow'>\(title)<figure class='code'>\(caption)<pre><code>\(html.escape(item.body))</code></pre></figure></div></section>"
+}
+
+fn callout_block(item: model.Block) -> Text {
+let title = if item.heading == "" { "" } else { "<strong>\(inline(item.heading))</strong>" }
+"<section class='block'><div class='wrap narrow'><aside class='callout'>\(title)\(paragraphs(item.body))</aside></div></section>"
+}
+
+fn cta_block(item: model.Block) -> Text {
+let title = heading_html("h2", item.heading)
+"<section class='cta'><div class='wrap narrow'>\(title)\(paragraphs(item.body))\(buttons(item.extra))</div></section>"
+}
+
+fn block_html(item: model.Block) -> Text {
+match item.kind {
+"hero" => hero_block(item)
+"banner" => banner_block(item)
+"section" => section_block(item)
+"cards" => cards_block(item)
+"steps" => steps_block(item)
+"list" => list_block(item)
+"code" => code_block(item)
+"callout" => callout_block(item)
+"cta" => cta_block(item)
+_ => ""
+}
+}
+
+// ---------- the page around the blocks ----------
+
+note "A version for the stylesheet URL, so browsers fetch a new stylesheet when the program ships one."
+fn style_version() -> Text = slice_text(hex_encode(sha256(to_bytes(style.css()))), 0, 10)
+
+fn nav_link(entry: model.Page, current_slug: Text) -> Text {
+let mark = if entry.slug == current_slug { " aria-current='page'" } else { "" }
+"<a href='\(page_url(entry.slug))'\(mark)>\(html.escape(entry.nav_label))</a>"
+}
+
+fn header_html(site: Map[Text, Text], navigation: List[model.Page], current_slug: Text) -> Text {
+var links: List[Text] = []
+for entry in navigation {
+set links += [nav_link(entry, current_slug)]
+}
+let name = html.escape(setting(site, "site_name", "Tessera"))
+let github = html.escape(setting(site, "github_url", "https://github.com/dib0/Tessera-language"))
+"<a class='skip' href='#main'>Skip to content</a><header class='site'><div class='wrap bar'><a class='brand' href='/'><img src='/assets/mark.svg' alt='' width='34' height='34'><span>\(name)</span></a><nav aria-label='Main'>\(join(links, ""))<a class='gh' href='\(github)' rel='noopener'>GitHub</a></nav></div></header>"
+}
+
+fn footer_html(site: Map[Text, Text]) -> Text {
+var links: List[Text] = []
+for row in rows_of(setting(site, "footer_links", "")) {
+let cells = cells_of(row)
+let wanted = cell(cells, 1)
+if safe_target(wanted) {
+set links += [anchor(html.escape(cell(cells, 0)), html.escape(wanted))]
+}
+}
+"<footer class='site'><div class='wrap'><p>\(inline(setting(site, "footer_text", "")))</p><p>\(join(links, " · "))</p></div></footer>"
+}
+
+note "A complete HTML document around `inner`. Used for the pages and for the admin page."
+pub fn shell(site: Map[Text, Text], title: Text, description: Text, robots: Text, inner: Text) -> Text {
+let language = html.escape(setting(site, "language", "en"))
+let head = "<meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><meta name='robots' content='\(html.escape(robots))'><title>\(html.escape(title))</title><meta name='description' content='\(html.escape(description))'><link rel='icon' type='image/svg+xml' href='/assets/mark.svg'><link rel='stylesheet' href='/assets/site.css?v=\(style_version())'>"
+"<!doctype html>\n<html lang='\(language)'>\n<head>\n\(head)\n</head>\n<body>\n\(inner)\n</body>\n</html>\n"
+}
+
+pub fn document(site: Map[Text, Text], navigation: List[model.Page], current: model.Page, items: List[model.Block]) -> Text {
+let name = setting(site, "site_name", "Tessera")
+let title = if current.slug == "home" { "\(name): \(setting(site, "tagline", ""))" } else { "\(current.title) · \(name)" }
+var body: List[Text] = []
+for item in items {
+set body += [block_html(item)]
+}
+let inner = "\(header_html(site, navigation, current.slug))\n<main id='main'>\n\(join(body, "\n"))\n</main>\n\(footer_html(site))"
+shell(site, title, current.description, "index, follow", inner)
+}

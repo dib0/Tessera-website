@@ -1,0 +1,110 @@
+// The admin page: for now it only shows the statistics.
+//
+// Access uses HTTP Basic authentication. The user name and the password come from the environment variables
+// ADMIN_USER and ADMIN_PASSWORD (set in docker-compose.yml). Without both, the page is disabled. Basic
+// authentication sends the password with every request, so put the site behind HTTPS when it is public.
+
+import std/http
+import std/html
+import store uses db, env, random
+import stats uses db
+import view uses nothing
+
+fn no_store(answer: http.Response) -> http.Response = http.with_header(http.with_header(answer, "cache-control", "no-store"), "x-robots-tag", "noindex")
+
+fn given_credentials(request: http.Request) -> Option[List[Text]] {
+let line = http.header(request, "authorization") else return .None
+if not starts_with(to_lower(line), "basic ") {
+return .None
+}
+let encoded = trim(slice_text(line, 6, length(line)))
+let raw = base64_decode(encoded) else return .None
+let decoded = from_bytes(raw) else return .None
+let colon = index_of(decoded, ":") else return .None
+.Some([slice_text(decoded, 0, colon), slice_text(decoded, colon + 1, length(decoded))])
+}
+
+note "Compares through SHA-256 digests in constant time, so neither the length nor the content of the secret leaks through timing."
+fn same(given: Text, expected: Text) -> Bool = equal_constant_time(sha256(to_bytes(given)), sha256(to_bytes(expected)))
+
+fn allowed(request: http.Request, user: Text, password: Text) -> Bool {
+let given = given_credentials(request) else return false
+let user_ok = same(given[0], user)
+let password_ok = same(given[1], password)
+user_ok and password_ok
+}
+
+// ---------- rendering ----------
+
+fn stat_tile(item: stats.Window) -> Text = "<div class='stat'><b>\(item.views)</b><span>\(html.escape(item.label))</span><br><span>\(item.visitors) visitors</span></div>"
+
+fn count_row(entry: stats.Count) -> Text = "<tr><td>\(html.escape(entry.label))</td><td class='n'>\(entry.views)</td><td class='n'>\(entry.visitors)</td></tr>"
+
+fn count_table(title: Text, first_column: Text, entries: List[stats.Count]) -> Text {
+let body = if length(entries) == 0 { "<tr><td colspan='3' class='muted'>Nothing yet.</td></tr>" } else { join(map(entries, count_row), "") }
+"<section><h2>\(html.escape(title))</h2><table><thead><tr><th>\(html.escape(first_column))</th><th class='n'>Views</th><th class='n'>Visitors</th></tr></thead><tbody>\(body)</tbody></table></section>"
+}
+
+note "Bars for the views per day: an inline SVG, so the page needs no script."
+fn chart(days: List[stats.Window]) -> Text {
+let count = length(days)
+if count == 0 {
+return ""
+}
+var peak = 1
+for day in days {
+if day.views > peak {
+set peak = day.views
+}
+}
+let slot = 640 / count
+let bar_width = slot - 12
+var bars: List[Text] = []
+for index in range(0, count) {
+let day = days[index]
+let height = day.views * 110 / peak
+let left = index * slot + 6
+let top = 130 - height
+let tip = "\(day.label): \(day.views) views, \(day.visitors) visitors"
+let caption = slice_text(day.label, 5, 10)
+set bars += ["<rect class='bar-rect' x='\(left)' y='\(top)' width='\(bar_width)' height='\(height)' rx='3'><title>\(html.escape(tip))</title></rect><text x='\(left + bar_width / 2)' y='150'>\(html.escape(caption))</text>"]
+}
+"<svg class='chart' viewBox='0 0 640 160' role='img' aria-label='Page views per day, last 14 days'><line class='axis' x1='0' y1='130' x2='640' y2='130'/>\(join(bars, ""))</svg>"
+}
+
+fn render(site: Map[Text, Text], data: stats.Report) -> Text {
+let since = if data.first_day == "" { "No visits recorded yet." } else { "Counting since \(data.first_day)." }
+let tiles = join(map([data.today, data.week, data.month, data.everything], stat_tile), "")
+let top_pages = count_table("Top pages, last 30 days", "Page", data.pages)
+let top_referrers = count_table("Referrers, last 30 days", "Host", data.referrers)
+let top_browsers = count_table("Browsers, last 30 days", "Browser", data.browsers)
+let not_found = count_table("Not found, last 30 days", "Path", data.missing)
+let intro = "\(html.escape(since)) A visitor is counted once per day. Bots are left out of these numbers; \(data.bot_views) bot views were recorded."
+let inner = "<header class='site'><div class='wrap bar'><a class='brand' href='/'><img src='/assets/mark.svg' alt='' width='34' height='34'><span>Tessera admin</span></a><nav aria-label='Admin'><a href='/' >View site</a></nav></div></header><main id='main'><section class='block'><div class='wrap'><h1>Statistics</h1><p class='intro'>\(intro)</p><div class='stats'>\(tiles)</div><h2>Views per day</h2>\(chart(data.days))</div></section><section class='block'><div class='wrap'><div class='grid2'>\(top_pages)\(top_referrers)\(top_browsers)\(not_found)</div></div></section></main>"
+view.shell(site, "Statistics · Tessera admin", "Site statistics", "noindex, nofollow", inner)
+}
+
+// ---------- the request ----------
+
+pub fn respond(request: http.Request) -> http.Response uses db, env, log, random, time {
+let user = environment_variable("ADMIN_USER")
+let password = environment_variable("ADMIN_PASSWORD")
+if user == "" or password == "" {
+return no_store(http.text(503, "The admin page is disabled: set ADMIN_USER and ADMIN_PASSWORD.\n"))
+}
+if not allowed(request, user, password) {
+sleep(750)
+log("warn", "rejected admin login from \(request.remote_address)")
+let challenge = http.with_header(http.text(401, "Authentication required.\n"), "www-authenticate", "Basic realm=\"Tessera admin\", charset=\"UTF-8\"")
+return no_store(challenge)
+}
+if request.path != "/admin" and request.path != "/admin/" {
+return no_store(http.not_found())
+}
+if request.method != "GET" and request.method != "HEAD" {
+return no_store(http.with_header(http.text(405, "method not allowed\n"), "allow", "GET, HEAD"))
+}
+let connection = store.open() else return no_store(http.text(503, "The database is unavailable.\n"))
+let data = stats.report(connection, now())
+no_store(http.html(200, render(store.load_settings(connection), data)))
+}
