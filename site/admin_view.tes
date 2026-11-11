@@ -1,0 +1,230 @@
+// The HTML of the admin pages. Pure: admin.tes reads the database and passes the values in.
+//
+// Everything that comes from the database or the request is escaped. Every form that changes something carries the
+// session's CSRF token in the field `csrf`. No inline script or style: the Content-Security-Policy forbids both.
+
+import std/html
+import model uses nothing
+import stats uses db
+import manage uses db, env, random
+import view uses nothing
+
+fn esc(text: Text) -> Text = html.escape(text)
+
+fn csrf_field(csrf: Text) -> Text = "<input type='hidden' name='csrf' value='\(esc(csrf))'>"
+
+fn messages(notice: Text, problem: Text) -> Text {
+let good = if notice == "" { "" } else { "<p class='notice' role='status'>\(esc(notice))</p>" }
+let bad = if problem == "" { "" } else { "<p class='problem' role='alert'>\(esc(problem))</p>" }
+good + bad
+}
+
+fn text_input(name: Text, label: Text, value: Text, help: Text, extra: Text) -> Text {
+let hint = if help == "" { "" } else { "<small>\(esc(help))</small>" }
+"<label class='field'><span>\(esc(label))</span><input type='text' name='\(name)' value='\(esc(value))'\(extra)>\(hint)</label>"
+}
+
+fn text_area(name: Text, label: Text, value: Text, help: Text, rows: Int, extra: Text) -> Text {
+let hint = if help == "" { "" } else { "<small>\(esc(help))</small>" }
+"<label class='field'><span>\(esc(label))</span><textarea name='\(name)' rows='\(rows)'\(extra)>\(esc(value))</textarea>\(hint)</label>"
+}
+
+fn nav_item(entry: List[Text], section: Text) -> Text {
+let mark = if entry[0] == section { " aria-current='page'" } else { "" }
+"<a href='\(entry[1])'\(mark)>\(entry[2])</a>"
+}
+
+note "The frame of every page behind the login: header with the admin menu and a logout button."
+pub fn layout(site: Map[Text, Text], title: Text, section: Text, csrf: Text, inner: Text) -> Text {
+var links: List[Text] = []
+for entry in [["statistics", "/admin", "Statistics"], ["pages", "/admin/pages", "Pages"], ["settings", "/admin/settings", "Settings"], ["account", "/admin/account", "Account"], ["site", "/", "View site"]] {
+set links += [nav_item(entry, section)]
+}
+let logout = "<form class='inline' method='post' action='/admin/logout'>\(csrf_field(csrf))<button type='submit' class='linkish'>Log out</button></form>"
+let header = "<a class='skip' href='#main'>Skip to content</a><header class='site'><div class='wrap bar'><a class='brand' href='/admin'><img src='/assets/img/mark.svg' alt='' width='38' height='38'><span>Tessera admin</span></a><nav class='main' aria-label='Admin'>\(join(links, ""))\(logout)</nav></div></header>"
+view.shell(site, "\(title) · Tessera admin", title, "noindex, nofollow", "\(header)<main id='main' class='admin'>\(inner)</main>")
+}
+
+fn lone(site: Map[Text, Text], title: Text, inner: Text) -> Text {
+let header = "<header class='site'><div class='wrap bar'><a class='brand' href='/'><img src='/assets/img/mark.svg' alt='' width='38' height='38'><span>Tessera admin</span></a><nav class='main' aria-label='Site'><a href='/'>View site</a></nav></div></header>"
+view.shell(site, "\(title) · Tessera admin", title, "noindex, nofollow", "\(header)<main id='main' class='admin'><section class='block'><div class='wrap login'>\(inner)</div></section></main>")
+}
+
+// ---------- logging in ----------
+
+pub fn login_page(site: Map[Text, Text], user: Text, problem: Text) -> Text {
+let form = "<form class='panel' method='post' action='/admin/login'><label class='field'><span>User name</span><input type='text' name='user' value='\(esc(user))' autocomplete='username' autocapitalize='none' spellcheck='false' required autofocus></label><label class='field'><span>Password</span><input type='password' name='password' autocomplete='current-password' required></label><p class='actions'><button type='submit' class='btn primary'>Log in</button></p></form>"
+let hint = "<p class='muted small'>The session cookie is only sent over HTTPS (or to localhost), so log in over HTTPS.</p>"
+lone(site, "Log in", "<h1>Log in</h1>\(messages("", problem))\(form)\(hint)")
+}
+
+pub fn code_page(site: Map[Text, Text], csrf: Text, problem: Text) -> Text {
+let form = "<form class='panel' method='post' action='/admin/login/code'>\(csrf_field(csrf))<label class='field'><span>Authentication code</span><input type='text' name='code' inputmode='numeric' autocomplete='one-time-code' pattern='[0-9 ]{6,7}' maxlength='7' required autofocus><small>The 6-digit code from your authenticator app.</small></label><p class='actions'><button type='submit' class='btn primary'>Verify</button></p></form>"
+let back = "<form class='inline' method='post' action='/admin/logout'>\(csrf_field(csrf))<button type='submit' class='linkish'>Start again</button></form>"
+lone(site, "Two-factor authentication", "<h1>Two-factor authentication</h1>\(messages("", problem))\(form)<p class='muted small'>Lost your phone? \(back), or see the README for resetting 2FA from the server.</p>")
+}
+
+// ---------- statistics ----------
+
+fn stat_tile(item: stats.Window) -> Text = "<div class='stat'><b>\(item.views)</b><span>\(esc(item.label))</span><br><span>\(item.visitors) visitors</span></div>"
+
+fn count_row(entry: stats.Count) -> Text = "<tr><td>\(esc(entry.label))</td><td class='n'>\(entry.views)</td><td class='n'>\(entry.visitors)</td></tr>"
+
+fn count_table(title: Text, first_column: Text, entries: List[stats.Count]) -> Text {
+let body = if length(entries) == 0 { "<tr><td colspan='3' class='muted'>Nothing yet.</td></tr>" } else { join(map(entries, count_row), "") }
+"<section><h2>\(esc(title))</h2><table><thead><tr><th>\(esc(first_column))</th><th class='n'>Views</th><th class='n'>Visitors</th></tr></thead><tbody>\(body)</tbody></table></section>"
+}
+
+fn larger_views(peak: Int, day: stats.Window) -> Int = if day.views > peak { day.views } else { peak }
+
+note "Bars for the views per day: an inline SVG, so the page needs no script."
+fn chart(days: List[stats.Window]) -> Text {
+let count = length(days)
+if count == 0 {
+return ""
+}
+var peak = 1
+for day in days {
+set peak = larger_views(peak, day)
+}
+let slot = 640 / count
+let bar_width = slot - 12
+var bars: List[Text] = []
+for index in range(0, count) {
+let day = days[index]
+let height = day.views * 110 / peak
+let left = index * slot + 6
+let tip = "\(day.label): \(day.views) views, \(day.visitors) visitors"
+set bars += ["<rect class='bar-rect' x='\(left)' y='\(130 - height)' width='\(bar_width)' height='\(height)' rx='3'><title>\(esc(tip))</title></rect><text x='\(left + bar_width / 2)' y='150'>\(esc(slice_text(day.label, 5, 10)))</text>"]
+}
+"<svg class='chart' viewBox='0 0 640 160' role='img' aria-label='Page views per day, last 14 days'><line class='axis' x1='0' y1='130' x2='640' y2='130'/>\(join(bars, ""))</svg>"
+}
+
+pub fn statistics(data: stats.Report) -> Text {
+let since = if data.first_day == "" { "No visits recorded yet." } else { "Counting since \(data.first_day)." }
+let tiles = join(map([data.today, data.week, data.month, data.everything], stat_tile), "")
+let tables = count_table("Top pages, last 30 days", "Page", data.pages) + count_table("Referrers, last 30 days", "Host", data.referrers) + count_table("Browsers, last 30 days", "Browser", data.browsers) + count_table("Not found, last 30 days", "Path", data.missing)
+let intro = "\(esc(since)) A visitor is counted once per day. Bots are left out of these numbers; \(data.bot_views) bot views were recorded."
+"<section class='block'><div class='wrap'><h1>Statistics</h1><p class='intro'>\(intro)</p><div class='stats'>\(tiles)</div><h2>Views per day</h2>\(chart(data.days))</div></section><section class='block'><div class='wrap'><div class='grid2'>\(tables)</div></div></section>"
+}
+
+// ---------- pages ----------
+
+fn status_badge(page: model.Page) -> Text = if page.published { "<span class='badge on'>Published</span>" } else { "<span class='badge'>Draft</span>" }
+
+fn page_row(entry: manage.PageSummary) -> Text {
+let page = entry.page
+let menu = if page.nav_order > 0 { "\(page.nav_order) · \(esc(page.nav_label))" } else { "<span class='muted'>not in menu</span>" }
+"<tr><td><a href='/admin/pages/\(esc(page.slug))'>\(esc(page.title))</a></td><td><code>\(esc(view.page_url(page.slug)))</code></td><td>\(menu)</td><td>\(status_badge(page))</td><td class='n'>\(entry.blocks)</td></tr>"
+}
+
+pub fn pages_list(pages: List[manage.PageSummary], csrf: Text, notice: Text, problem: Text, slug: Text, title: Text) -> Text {
+let rows = join(map(pages, page_row), "")
+let table = "<table><thead><tr><th>Title</th><th>Address</th><th>Menu</th><th>Status</th><th class='n'>Blocks</th></tr></thead><tbody>\(rows)</tbody></table>"
+let fields = text_input("slug", "Address", slug, "Lowercase letters, digits and dashes; the page is served at /address.", " required maxlength='60' pattern='[a-z0-9][a-z0-9-]*' autocapitalize='none' spellcheck='false'") + text_input("title", "Title", title, "", " required")
+let create = "<form class='panel' method='post' action='/admin/pages'>\(csrf_field(csrf))<h2>New page</h2>\(fields)<p class='actions'><button type='submit' class='btn primary'>Create page</button></p><p class='muted small'>A new page starts as a draft, outside the menu.</p></form>"
+"<section class='block'><div class='wrap'><h1>Pages</h1>\(messages(notice, problem))\(table)</div></section><section class='block'><div class='wrap narrow'>\(create)</div></section>"
+}
+
+fn kind_options(selected: Text) -> Text {
+var out = ""
+for kind in model.kinds() {
+let mark = if kind.name == selected { " selected" } else { "" }
+set out += "<option value='\(kind.name)'\(mark)>\(kind.name)</option>"
+}
+out
+}
+
+fn kind_row(kind: model.Kind) -> Text = "<tr><td><code>\(kind.name)</code></td><td>\(esc(kind.heading))</td><td>\(esc(kind.body))</td><td>\(esc(kind.extra))</td></tr>"
+
+fn kind_help(selected: Text) -> model.Kind {
+for kind in model.kinds() {
+if kind.name == selected {
+return kind
+}
+}
+model.Kind { name: selected, heading: "Heading", body: "Body", extra: "Extra" }
+}
+
+fn block_form(item: model.Block, index: Int, count: Int, csrf: Text) -> Text {
+let kind = kind_help(item.kind)
+let base = "/admin/blocks/\(item.id)"
+let up = if index > 0 { "<button type='submit' class='btn small' formaction='\(base)/up' title='Move up'>↑ Up</button>" } else { "" }
+let down = if index < count - 1 { "<button type='submit' class='btn small' formaction='\(base)/down' title='Move down'>↓ Down</button>" } else { "" }
+let fields = "<label class='field'><span>Kind</span><select name='kind'>\(kind_options(item.kind))</select></label>" + text_input("heading", "Heading", item.heading, kind.heading, "") + text_area("body", "Body", item.body, kind.body, 6, "") + text_area("extra", "Extra", item.extra, kind.extra, 3, "")
+"<form class='panel block-form' id='block-\(item.id)' method='post' action='\(base)'>\(csrf_field(csrf))<p class='block-head'><b>\(index + 1). \(item.kind)</b></p>\(fields)<p class='actions'><button type='submit' class='btn primary small'>Save block</button>\(up)\(down)<button type='submit' class='btn small danger' formaction='\(base)/delete' data-confirm='Delete this block?'>Delete</button></p></form>"
+}
+
+pub fn page_editor(page: model.Page, original_slug: Text, blocks: List[model.Block], csrf: Text, notice: Text, problem: Text) -> Text {
+let base = "/admin/pages/\(esc(original_slug))"
+let fixed = manage.is_fixed(original_slug)
+let address_extra = if fixed { " readonly" } else { " required maxlength='60' pattern='[a-z0-9][a-z0-9-]*' autocapitalize='none' spellcheck='false'" }
+let address_help = if fixed { "This page has a fixed role and keeps its address." } else { "Changing it changes the address of the page." }
+let checked = if page.published or fixed { " checked" } else { "" }
+let disabled = if fixed { " disabled" } else { "" }
+let published = "<label class='check'><input type='checkbox' name='published' value='1'\(checked)\(disabled)> Published</label>"
+let details_fields = text_input("title", "Title", page.title, "The browser title and the page name in the admin.", " required") + text_input("slug", "Address", page.slug, address_help, address_extra) + text_area("description", "Description", page.description, "For search engines and link previews.", 2, "") + text_input("nav_label", "Menu label", page.nav_label, "", "") + text_input("nav_order", "Menu position", to_text(page.nav_order), "0 keeps the page out of the menu; lower numbers come first.", " inputmode='numeric' pattern='[0-9]*'") + published
+let details = "<form class='panel' method='post' action='\(base)'>\(csrf_field(csrf))<h2>Details</h2>\(details_fields)<p class='actions'><button type='submit' class='btn primary'>Save details</button></p></form>"
+var forms: List[Text] = []
+for index in range(0, length(blocks)) {
+set forms += [block_form(blocks[index], index, length(blocks), csrf)]
+}
+let empty = if length(blocks) == 0 { "<p class='muted'>This page has no blocks yet.</p>" } else { "" }
+let add = "<form class='panel inline-form' method='post' action='\(base)/blocks'>\(csrf_field(csrf))<label class='field'><span>New block</span><select name='kind'>\(kind_options("section"))</select></label><button type='submit' class='btn'>Add block</button></form>"
+let legend = "<details class='legend'><summary>What the fields of each kind mean</summary><table><thead><tr><th>Kind</th><th>Heading</th><th>Body</th><th>Extra</th></tr></thead><tbody>\(join(map(model.kinds(), kind_row), ""))</tbody></table><p class='muted small'>In headings and text, `code` is code and [label](url) is a link (http, https, mailto, /path or #anchor).</p></details>"
+let removal = if fixed { "" } else { "<form class='panel danger-zone' method='post' action='\(base)/delete'>\(csrf_field(csrf))<h2>Delete page</h2><p class='muted'>Deletes the page and all its blocks. This cannot be undone.</p><button type='submit' class='btn danger' data-confirm='Delete this page and all its blocks?'>Delete page</button></form>" }
+let live = if page.published or fixed { " · <a href='\(esc(view.page_url(original_slug)))'>View live</a>" } else { "" }
+let crumbs = "<p class='crumbs'><a href='/admin/pages'>Pages</a> / <code>\(esc(view.page_url(original_slug)))</code> · <a href='\(base)/preview'>Preview</a>\(live)</p>"
+"<section class='block'><div class='wrap narrow'>\(crumbs)<h1>\(esc(page.title))</h1>\(messages(notice, problem))\(details)<h2>Blocks</h2>\(legend)\(empty)\(join(forms, ""))\(add)\(removal)</div></section>"
+}
+
+// ---------- settings ----------
+
+fn setting_input(field: manage.Field, current: Map[Text, Text]) -> Text {
+let value = value_or(get(current, field.name), "")
+if field.multiline {
+return text_area(field.name, field.label, value, field.help, 4, "")
+}
+text_input(field.name, field.label, value, field.help, "")
+}
+
+pub fn settings_page(current: Map[Text, Text], csrf: Text, notice: Text, problem: Text) -> Text {
+var inputs = ""
+for field in manage.setting_fields() {
+set inputs += setting_input(field, current)
+}
+"<section class='block'><div class='wrap narrow'><h1>Settings</h1>\(messages(notice, problem))<form class='panel' method='post' action='/admin/settings'>\(csrf_field(csrf))\(inputs)<p class='actions'><button type='submit' class='btn primary'>Save settings</button></p></form></div></section>"
+}
+
+// ---------- account and 2FA ----------
+
+pub type Account {
+user: Text
+enabled: Bool
+pending: Text
+qr: Text
+uri: Text
+sessions: Int
+}
+
+fn code_input() -> Text = "<label class='field'><span>Authentication code</span><input type='text' name='code' inputmode='numeric' autocomplete='one-time-code' pattern='[0-9 ]{6,7}' maxlength='7' required></label>"
+
+fn two_factor(account: Account, csrf: Text) -> Text {
+if account.enabled {
+return "<p><span class='badge on'>On</span> Logging in needs your password and a code from your authenticator app.</p><form class='panel' method='post' action='/admin/account/totp/disable'>\(csrf_field(csrf))<h3>Turn two-factor authentication off</h3><label class='field'><span>Password</span><input type='password' name='password' autocomplete='current-password' required></label>\(code_input())<p class='actions'><button type='submit' class='btn danger'>Turn off</button></p></form>"
+}
+if account.pending != "" {
+let steps = "<ol class='plain'><li>Open your authenticator app (Aegis, Google Authenticator, 1Password, ...) and add an account.</li><li>Scan the QR code, or type the key by hand.</li><li>Enter the 6-digit code the app shows.</li></ol>"
+let key = "<p class='secret'><span class='muted small'>Key</span><br><code>\(esc(account.pending))</code></p>"
+let confirm = "<form method='post' action='/admin/account/totp/confirm'>\(csrf_field(csrf))\(code_input())<p class='actions'><button type='submit' class='btn primary'>Turn on</button></p></form>"
+let cancel = "<form class='inline' method='post' action='/admin/account/totp/cancel'>\(csrf_field(csrf))<button type='submit' class='linkish'>Cancel the setup</button></form>"
+return "<div class='panel setup'><div class='qr-box'>\(account.qr)</div><div>\(steps)\(key)\(confirm)<p class='small'>\(cancel)</p></div></div>"
+}
+"<p><span class='badge'>Off</span> Logging in needs only your password.</p><form method='post' action='/admin/account/totp/start'>\(csrf_field(csrf))<p class='actions'><button type='submit' class='btn primary'>Set up two-factor authentication</button></p></form>"
+}
+
+pub fn account_page(account: Account, csrf: Text, notice: Text, problem: Text) -> Text {
+let who = "<p>You are logged in as <b>\(esc(account.user))</b>. The user name and password come from <code>ADMIN_USER</code> and <code>ADMIN_PASSWORD</code> on the server.</p>"
+let everywhere = "<form method='post' action='/admin/account/logout-all'>\(csrf_field(csrf))<p>Active sessions: \(account.sessions).</p><p class='actions'><button type='submit' class='btn'>Log out everywhere</button></p></form>"
+"<section class='block'><div class='wrap narrow'><h1>Account</h1>\(messages(notice, problem))\(who)<h2>Two-factor authentication</h2>\(two_factor(account, csrf))<h2>Sessions</h2>\(everywhere)</div></section>"
+}

@@ -1,0 +1,336 @@
+// QR codes (ISO/IEC 18004) as inline SVG, so the 2FA setup page can show its secret to an authenticator app
+// without a script or an external service. Pure.
+//
+// Only what an otpauth:// address needs: byte mode, error correction level M, versions 1 to 10 (up to 213 bytes)
+// and the fixed mask 0. Every mask gives a valid code; the spec's penalty rules only pick the prettiest one.
+// The output is checked module by module against a reference encoder (see the tests in main.tes).
+
+import std/math
+import std/html
+
+type Layout {
+version: Int
+ec_per_block: Int
+short_blocks: Int
+short_data: Int
+long_blocks: Int
+}
+
+pub type Grid {
+size: Int
+dark: List[Bool]
+reserved: List[Bool]
+}
+
+note "Error correction level M, from table 9 of the standard: EC codewords per block, and the blocks (long blocks carry one more data codeword)."
+fn layouts() -> List[Layout] {
+[
+Layout { version: 1, ec_per_block: 10, short_blocks: 1, short_data: 16, long_blocks: 0 },
+Layout { version: 2, ec_per_block: 16, short_blocks: 1, short_data: 28, long_blocks: 0 },
+Layout { version: 3, ec_per_block: 26, short_blocks: 1, short_data: 44, long_blocks: 0 },
+Layout { version: 4, ec_per_block: 18, short_blocks: 2, short_data: 32, long_blocks: 0 },
+Layout { version: 5, ec_per_block: 24, short_blocks: 2, short_data: 43, long_blocks: 0 },
+Layout { version: 6, ec_per_block: 16, short_blocks: 4, short_data: 27, long_blocks: 0 },
+Layout { version: 7, ec_per_block: 18, short_blocks: 4, short_data: 31, long_blocks: 0 },
+Layout { version: 8, ec_per_block: 22, short_blocks: 2, short_data: 38, long_blocks: 2 },
+Layout { version: 9, ec_per_block: 22, short_blocks: 3, short_data: 36, long_blocks: 2 },
+Layout { version: 10, ec_per_block: 26, short_blocks: 4, short_data: 43, long_blocks: 1 }
+]
+}
+
+fn alignment_positions(version: Int) -> List[Int] {
+match version {
+1 => []
+2 => [6, 18]
+3 => [6, 22]
+4 => [6, 26]
+5 => [6, 30]
+6 => [6, 34]
+7 => [6, 22, 38]
+8 => [6, 24, 42]
+9 => [6, 26, 46]
+_ => [6, 28, 50]
+}
+}
+
+fn data_capacity(layout: Layout) -> Int = layout.short_blocks * layout.short_data + layout.long_blocks * (layout.short_data + 1)
+
+fn count_bits(version: Int) -> Int = if version <= 9 { 8 } else { 16 }
+
+fn choose(size: Int) -> Option[Layout] {
+for layout in layouts() {
+if 4 + count_bits(layout.version) + size * 8 <= data_capacity(layout) * 8 {
+return .Some(layout)
+}
+}
+.None
+}
+
+// ---------- Reed-Solomon over GF(256) with the polynomial 0x11D ----------
+
+fn gf_multiply(x: Int, y: Int) -> Int {
+var z = 0
+for step in range(0, 8) {
+set z = bit_xor(shift_left(z, 1), shift_right(z, 7) * 285)
+set z = bit_xor(z, bit_and(shift_right(y, 7 - step), 1) * x)
+}
+z
+}
+
+fn rs_divisor(degree: Int) -> List[Int] {
+var result = repeat([0], degree)
+set result[degree - 1] = 1
+var root = 1
+for _ in range(0, degree) {
+for j in range(0, degree) {
+set result[j] = gf_multiply(result[j], root)
+if j + 1 < degree {
+set result[j] = bit_xor(result[j], result[j + 1])
+}
+}
+set root = gf_multiply(root, 2)
+}
+result
+}
+
+fn rs_remainder(data: List[Int], divisor: List[Int]) -> List[Int] {
+let degree = length(divisor)
+var result = repeat([0], degree)
+for value in data {
+let factor = bit_xor(value, result[0])
+set result = slice(result, 1, degree) + [0]
+for i in range(0, degree) {
+set result[i] = bit_xor(result[i], gf_multiply(divisor[i], factor))
+}
+}
+result
+}
+
+// ---------- the codewords ----------
+
+fn append_bits(bits: List[Int], value: Int, count: Int) -> List[Int] {
+var out = bits
+for step in range(0, count) {
+set out += [bit_and(shift_right(value, count - 1 - step), 1)]
+}
+out
+}
+
+fn data_codewords(layout: Layout, data: List[Int]) -> List[Int] {
+let capacity = data_capacity(layout) * 8
+var bits = append_bits([], 4, 4)
+set bits = append_bits(bits, length(data), count_bits(layout.version))
+for value in data {
+set bits = append_bits(bits, value, 8)
+}
+set bits = append_bits(bits, 0, math.min(4, capacity - length(bits)))
+set bits = append_bits(bits, 0, (8 - length(bits) % 8) % 8)
+var words: List[Int] = []
+for index in range(0, length(bits) / 8) {
+var value = 0
+for bit in slice(bits, index * 8, index * 8 + 8) {
+set value = value * 2 + bit
+}
+set words += [value]
+}
+var pad = 236
+while length(words) < capacity / 8 {
+set words += [pad]
+set pad = if pad == 236 { 17 } else { 236 }
+}
+words
+}
+
+note "Splits the data into blocks, adds the error correction of each block, and interleaves both, as the standard prescribes."
+fn codewords(layout: Layout, data: List[Int]) -> List[Int] {
+let divisor = rs_divisor(layout.ec_per_block)
+var blocks: List[List[Int]] = []
+var corrections: List[List[Int]] = []
+var start = 0
+for index in range(0, layout.short_blocks + layout.long_blocks) {
+let size = if index < layout.short_blocks { layout.short_data } else { layout.short_data + 1 }
+let block = slice(data, start, start + size)
+set blocks += [block]
+set corrections += [rs_remainder(block, divisor)]
+set start += size
+}
+var out: List[Int] = []
+for i in range(0, layout.short_data + 1) {
+for block in blocks {
+if i < length(block) {
+set out += [block[i]]
+}
+}
+}
+for i in range(0, layout.ec_per_block) {
+for correction in corrections {
+set out += [correction[i]]
+}
+}
+out
+}
+
+// ---------- the matrix ----------
+
+fn mark(grid: Grid, x: Int, y: Int, dark: Bool) -> Grid {
+var out = grid
+set out.dark[y * out.size + x] = dark
+set out.reserved[y * out.size + x] = true
+out
+}
+
+fn finder(grid: Grid, cx: Int, cy: Int) -> Grid {
+var out = grid
+for dy in range(-4, 5) {
+for dx in range(-4, 5) {
+let distance = math.max(math.abs(dx), math.abs(dy))
+let x = cx + dx
+let y = cy + dy
+if x >= 0 and x < out.size and y >= 0 and y < out.size {
+set out = mark(out, x, y, distance != 2 and distance != 4)
+}
+}
+}
+out
+}
+
+fn alignment(grid: Grid, cx: Int, cy: Int) -> Grid {
+var out = grid
+for dy in range(-2, 3) {
+for dx in range(-2, 3) {
+set out = mark(out, cx + dx, cy + dy, math.max(math.abs(dx), math.abs(dy)) != 1)
+}
+}
+out
+}
+
+fn bit_set(value: Int, index: Int) -> Bool = bit_and(shift_right(value, index), 1) == 1
+
+note "Level M (format bits 00) with mask 0, protected by the BCH(15,5) code and XOR-ed with 101010000010010."
+fn format_bits() -> Int {
+let data = 0
+var remainder = data
+for _ in range(0, 10) {
+set remainder = bit_xor(shift_left(remainder, 1), shift_right(remainder, 9) * 1335)
+}
+bit_xor(bit_or(shift_left(data, 10), remainder), 21522)
+}
+
+fn format_info(grid: Grid) -> Grid {
+let bits = format_bits()
+let size = grid.size
+var out = grid
+for i in range(0, 6) {
+set out = mark(out, 8, i, bit_set(bits, i))
+}
+set out = mark(out, 8, 7, bit_set(bits, 6))
+set out = mark(out, 8, 8, bit_set(bits, 7))
+set out = mark(out, 7, 8, bit_set(bits, 8))
+for i in range(9, 15) {
+set out = mark(out, 14 - i, 8, bit_set(bits, i))
+}
+for i in range(0, 8) {
+set out = mark(out, size - 1 - i, 8, bit_set(bits, i))
+}
+for i in range(8, 15) {
+set out = mark(out, 8, size - 15 + i, bit_set(bits, i))
+}
+mark(out, 8, size - 8, true)
+}
+
+note "Versions 7 and up carry their number twice, protected by the BCH(18,6) code."
+fn version_info(grid: Grid, version: Int) -> Grid {
+if version < 7 {
+return grid
+}
+var remainder = version
+for _ in range(0, 12) {
+set remainder = bit_xor(shift_left(remainder, 1), shift_right(remainder, 11) * 7973)
+}
+let bits = bit_or(shift_left(version, 12), remainder)
+var out = grid
+for i in range(0, 18) {
+let a = out.size - 11 + i % 3
+let b = i / 3
+set out = mark(out, a, b, bit_set(bits, i))
+set out = mark(out, b, a, bit_set(bits, i))
+}
+out
+}
+
+fn function_patterns(version: Int) -> Grid {
+let size = version * 4 + 17
+var out = Grid { size: size, dark: repeat([false], size * size), reserved: repeat([false], size * size) }
+for i in range(0, size) {
+set out = mark(out, 6, i, i % 2 == 0)
+set out = mark(out, i, 6, i % 2 == 0)
+}
+set out = finder(out, 3, 3)
+set out = finder(out, size - 4, 3)
+set out = finder(out, 3, size - 4)
+let positions = alignment_positions(version)
+let last = length(positions) - 1
+for i in range(0, length(positions)) {
+for j in range(0, length(positions)) {
+let corner = (i == 0 and j == 0) or (i == 0 and j == last) or (i == last and j == 0)
+if not corner {
+set out = alignment(out, positions[i], positions[j])
+}
+}
+}
+set out = format_info(out)
+version_info(out, version)
+}
+
+note "Places the bits in the zigzag order of the standard, two columns at a time from the bottom right, and applies mask 0 ((x + y) even means flipped) to them and to the remainder bits after them."
+fn place(grid: Grid, words: List[Int]) -> Grid {
+let size = grid.size
+let total = length(words) * 8
+var out = grid
+var index = 0
+var right = size - 1
+while right >= 1 {
+if right == 6 {
+set right = 5
+}
+let upward = bit_and(right + 1, 2) == 0
+for vertical in range(0, size) {
+for j in range(0, 2) {
+let x = right - j
+let y = if upward { size - 1 - vertical } else { vertical }
+let at = y * size + x
+if not out.reserved[at] {
+let bit = index < total and bit_set(words[index / 8], 7 - index % 8)
+set out.dark[at] = bit != ((x + y) % 2 == 0)
+set index += 1
+}
+}
+}
+set right -= 2
+}
+out
+}
+
+note "The QR code of `text`, or an error when it is longer than version 10 holds (213 bytes)."
+pub fn encode(text: Text) -> Result[Grid, Text] {
+let data = byte_values(to_bytes(text))
+let layout = choose(length(data)) else return .Error("text too long for a QR code: \(length(data)) bytes")
+let words = codewords(layout, data_codewords(layout, data))
+.Ok(place(function_patterns(layout.version), words))
+}
+
+pub fn is_dark(grid: Grid, x: Int, y: Int) -> Bool = grid.dark[y * grid.size + x]
+
+note "An SVG image with a quiet zone of four modules. Colors are attributes, not inline styles, so the strict Content-Security-Policy allows it."
+pub fn svg(grid: Grid, label: Text) -> Text {
+var path = ""
+for y in range(0, grid.size) {
+for x in range(0, grid.size) {
+if is_dark(grid, x, y) {
+set path += "M\(x + 4) \(y + 4)h1v1h-1z"
+}
+}
+}
+let side = grid.size + 8
+"<svg class='qr' viewBox='0 0 \(side) \(side)' role='img' aria-label='\(html.escape(label))' shape-rendering='crispEdges'><rect width='\(side)' height='\(side)' fill='#fff'/><path fill='#000' d='\(path)'/></svg>"
+}

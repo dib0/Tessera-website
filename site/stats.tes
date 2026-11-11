@@ -33,15 +33,6 @@ fn text_of(row: Map[Text, Text], name: Text) -> Text = value_or(get(row, name), 
 
 fn number(row: Map[Text, Text], name: Text) -> Int = value_or(parse_int(text_of(row, name)), 0)
 
-fn window(connection: Database, label: Text, since: Text) -> Window uses db {
-let empty = Window { label: label, views: 0, visitors: 0 }
-let rows = db_query(connection, "SELECT COUNT(*) AS views, COUNT(DISTINCT visitor) AS visitors FROM hits WHERE bot = 0 AND day >= ?1", [since]) else return empty
-if length(rows) == 0 {
-return empty
-}
-Window { label: label, views: number(rows[0], "views"), visitors: number(rows[0], "visitors") }
-}
-
 note "One bar per day, oldest first, with zeros for days without visits."
 fn daily(connection: Database, moment: Int, count: Int) -> List[Window] uses db {
 let rows = db_query(connection, "SELECT day, COUNT(*) AS views, COUNT(DISTINCT visitor) AS visitors FROM hits WHERE bot = 0 AND day >= ?1 GROUP BY day", [tracking.days_before(moment, count - 1)]) else return []
@@ -61,39 +52,37 @@ series
 note "The SQL must return the columns label, views and visitors."
 fn counts(connection: Database, sql: Text, since: Text) -> List[Count] uses db {
 let rows = db_query(connection, sql, [since]) else return []
-var out: List[Count] = []
-for row in rows {
-set out += [Count { label: text_of(row, "label"), views: number(row, "views"), visitors: number(row, "visitors") }]
-}
-out
+map(rows, count_from)
 }
 
-fn single_number(connection: Database, sql: Text, name: Text) -> Int uses db {
-let rows = db_query(connection, sql, []) else return 0
+fn count_from(row: Map[Text, Text]) -> Count = Count { label: text_of(row, "label"), views: number(row, "views"), visitors: number(row, "visitors") }
+
+note "The four windows, the bot views and the first day, in one pass over the table."
+fn summary(connection: Database, moment: Int) -> Report uses db {
+let today = tracking.day_of(moment)
+let week = tracking.days_before(moment, 6)
+let month = tracking.days_before(moment, 29)
+let sql = "SELECT SUM(bot = 0 AND day >= ?1) AS today_views, COUNT(DISTINCT CASE WHEN bot = 0 AND day >= ?1 THEN visitor END) AS today_visitors, SUM(bot = 0 AND day >= ?2) AS week_views, COUNT(DISTINCT CASE WHEN bot = 0 AND day >= ?2 THEN visitor END) AS week_visitors, SUM(bot = 0 AND day >= ?3) AS month_views, COUNT(DISTINCT CASE WHEN bot = 0 AND day >= ?3 THEN visitor END) AS month_visitors, SUM(bot = 0) AS all_views, COUNT(DISTINCT CASE WHEN bot = 0 THEN visitor END) AS all_visitors, SUM(bot) AS bot_views, MIN(day) AS first_day FROM hits"
+let rows = db_query(connection, sql, [today, week, month]) else return empty_report()
 if length(rows) == 0 {
-return 0
+return empty_report()
 }
-number(rows[0], name)
+let row = rows[0]
+let windows = [Window { label: "Today", views: number(row, "today_views"), visitors: number(row, "today_visitors") }, Window { label: "Last 7 days", views: number(row, "week_views"), visitors: number(row, "week_visitors") }, Window { label: "Last 30 days", views: number(row, "month_views"), visitors: number(row, "month_visitors") }, Window { label: "All time", views: number(row, "all_views"), visitors: number(row, "all_visitors") }]
+empty_report() with { today: windows[0], week: windows[1], month: windows[2], everything: windows[3], bot_views: number(row, "bot_views"), first_day: text_of(row, "first_day") }
 }
 
 pub fn report(connection: Database, moment: Int) -> Report uses db {
 let month_start = tracking.days_before(moment, 29)
-let first_rows = db_query(connection, "SELECT MIN(day) AS first_day FROM hits", []) else return empty_report()
-let first_day = if length(first_rows) == 0 { "" } else { text_of(first_rows[0], "first_day") }
-let today = window(connection, "Today", tracking.day_of(moment))
-let week = window(connection, "Last 7 days", tracking.days_before(moment, 6))
-let month = window(connection, "Last 30 days", month_start)
-let everything = window(connection, "All time", "0000-00-00")
-let bot_views = single_number(connection, "SELECT COUNT(*) AS n FROM hits WHERE bot = 1", "n")
-let days = daily(connection, moment, 14)
-let pages = counts(connection, "SELECT path AS label, COUNT(*) AS views, COUNT(DISTINCT visitor) AS visitors FROM hits WHERE bot = 0 AND status = 200 AND day >= ?1 GROUP BY path ORDER BY views DESC, path LIMIT 10", month_start)
-let referrers = counts(connection, "SELECT referrer AS label, COUNT(*) AS views, COUNT(DISTINCT visitor) AS visitors FROM hits WHERE bot = 0 AND referrer <> '' AND day >= ?1 GROUP BY referrer ORDER BY views DESC, referrer LIMIT 10", month_start)
-let browsers = counts(connection, "SELECT agent AS label, COUNT(*) AS views, COUNT(DISTINCT visitor) AS visitors FROM hits WHERE bot = 0 AND day >= ?1 GROUP BY agent ORDER BY views DESC, agent LIMIT 10", month_start)
-let missing = counts(connection, "SELECT path AS label, COUNT(*) AS views, COUNT(DISTINCT visitor) AS visitors FROM hits WHERE status = 404 AND day >= ?1 GROUP BY path ORDER BY views DESC, path LIMIT 10", month_start)
-Report { today: today, week: week, month: month, everything: everything, bot_views: bot_views, first_day: first_day, days: days, pages: pages, referrers: referrers, browsers: browsers, missing: missing }
+let top = "COUNT(*) AS views, COUNT(DISTINCT visitor) AS visitors FROM hits WHERE"
+let pages = counts(connection, "SELECT path AS label, \(top) bot = 0 AND status = 200 AND day >= ?1 GROUP BY path ORDER BY views DESC, path LIMIT 10", month_start)
+let referrers = counts(connection, "SELECT referrer AS label, \(top) bot = 0 AND referrer <> '' AND day >= ?1 GROUP BY referrer ORDER BY views DESC, referrer LIMIT 10", month_start)
+let browsers = counts(connection, "SELECT agent AS label, \(top) bot = 0 AND day >= ?1 GROUP BY agent ORDER BY views DESC, agent LIMIT 10", month_start)
+let missing = counts(connection, "SELECT path AS label, \(top) status = 404 AND day >= ?1 GROUP BY path ORDER BY views DESC, path LIMIT 10", month_start)
+summary(connection, moment) with { days: daily(connection, moment, 14), pages: pages, referrers: referrers, browsers: browsers, missing: missing }
 }
 
 fn empty_report() -> Report {
 let zero = Window { label: "", views: 0, visitors: 0 }
-Report { today: zero, week: zero, month: zero, everything: zero, bot_views: 0, first_day: "", days: [], pages: [], referrers: [], browsers: [], missing: [] }
+Report { today: zero with { label: "Today" }, week: zero with { label: "Last 7 days" }, month: zero with { label: "Last 30 days" }, everything: zero with { label: "All time" }, bot_views: 0, first_day: "", days: [], pages: [], referrers: [], browsers: [], missing: [] }
 }

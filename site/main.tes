@@ -10,6 +10,10 @@ import store uses db, env, random
 import view uses nothing
 import tracking uses nothing
 import admin uses db, env, log, random, time
+import manage uses db, env, random
+import totp uses nothing
+import qr uses nothing
+import auth uses db, env, random
 
 fn slug_of(path: Text) -> Text {
 if path == "/" {
@@ -40,10 +44,21 @@ store.record_hit(connection, moment, tracking.clip(request.path, 120), status, v
 }
 }
 
+fn page_response(connection: Database, site: Map[Text, Text], request: http.Request, slug: Text) -> http.Response uses db, time {
+let found = store.site_pages(connection, slug)
+let current = found.page else return missing(connection, site, request)
+if current.slug == "404" {
+return missing(connection, site, request)
+}
+remember(connection, site, request, 200)
+http.html(200, view.document(site, found.navigation, current, store.page_blocks(connection, current.slug)))
+}
+
 fn missing(connection: Database, site: Map[Text, Text], request: http.Request) -> http.Response uses db, time {
 remember(connection, site, request, 404)
-let current = store.find_page(connection, "404") else return http.text(404, "page not found\n")
-http.html(404, view.document(site, store.navigation(connection), current, store.page_blocks(connection, "404")))
+let found = store.site_pages(connection, "404")
+let current = found.page else return http.text(404, "page not found\n")
+http.html(404, view.document(site, found.navigation, current, store.page_blocks(connection, "404")))
 }
 
 fn unavailable() -> http.Response = http.text(503, "the site database is unavailable\n")
@@ -67,17 +82,7 @@ if slug == "home" and path != "/" {
 return http.redirect("/")
 }
 let connection = store.open() else return unavailable()
-let site = store.load_settings(connection)
-let current = match store.find_page(connection, slug) {
-.Some(found) => found
-.None => return missing(connection, site, request)
-}
-if current.slug == "404" {
-return missing(connection, site, request)
-}
-remember(connection, site, request, 200)
-let items = store.page_blocks(connection, current.slug)
-http.html(200, view.document(site, store.navigation(connection), current, items))
+page_response(connection, store.load_settings(connection), request, slug)
 }
 
 // ---------- tests: `tessera1 test site/main.tes` ----------
@@ -99,8 +104,8 @@ assert(slug_of("/why/") == "why")
 }
 
 test "a page is built from its blocks and everything from the database is escaped" {
-let details = model.Page { slug: "demo", title: "<b>Demo</b>", description: "a \"demo\"", nav_label: "Demo", nav_order: 1 }
-let items = [model.Block { kind: "section", heading: "A <i>heading</i>", body: "<script>alert(1)</script> and `code` and [a link](https://example.org/a?b=1&c=2)", extra: "" }]
+let details = model.Page { slug: "demo", title: "<b>Demo</b>", description: "a \"demo\"", nav_label: "Demo", nav_order: 1, published: true }
+let items = [model.Block { id: 0, kind: "section", heading: "A <i>heading</i>", body: "<script>alert(1)</script> and `code` and [a link](https://example.org/a?b=1&c=2)", extra: "" }]
 let output = view.document(["site_name": "Tessera"], [details], details, items)
 assert(not contains(output, "<script>"))
 assert(not contains(output, "<b>Demo"))
@@ -111,8 +116,8 @@ assert(contains(output, "aria-current='page'"))
 }
 
 test "links to other schemes stay plain text" {
-let details = model.Page { slug: "demo", title: "Demo", description: "", nav_label: "Demo", nav_order: 1 }
-let items = [model.Block { kind: "section", heading: "", body: "[click](javascript:alert(1))", extra: "" }]
+let details = model.Page { slug: "demo", title: "Demo", description: "", nav_label: "Demo", nav_order: 1, published: true }
+let items = [model.Block { id: 0, kind: "section", heading: "", body: "[click](javascript:alert(1))", extra: "" }]
 let output = view.document([:], [], details, items)
 assert(not contains(output, "href='javascript"))
 }
@@ -141,4 +146,97 @@ assert(tracking.referrer_host("not a url") == "")
 test "days are counted back from a moment" {
 assert(tracking.day_of(0) == "1970-01-01")
 assert(tracking.days_before(86400000 * 10, 3) == "1970-01-08")
+}
+
+test "SHA-1 and HMAC-SHA-1 match RFC 3174 and RFC 2202" {
+assert(hex_encode(totp.sha1(to_bytes("abc"))) == "a9993e364706816aba3e25717850c26c9cd0d89d")
+assert(hex_encode(totp.sha1(to_bytes(""))) == "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+assert(hex_encode(totp.sha1(to_bytes(repeat("a", 1000)))) == "291e9a6c66994949b57ba5e650361e98fc36b1ba")
+assert(hex_encode(totp.hmac_sha1(to_bytes("Jefe"), to_bytes("what do ya want for nothing?"))) == "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79")
+}
+
+test "one-time codes match RFC 4226 and RFC 6238" {
+let secret = to_bytes("12345678901234567890")
+assert(map([0, 1, 9], hotp_of_rfc_secret) == ["755224", "287082", "520489"])
+assert(totp.hotp(secret, totp.step_of(59000)) == "287082")
+assert(totp.hotp(secret, totp.step_of(1111111109000)) == "081804")
+assert(totp.hotp(secret, totp.step_of(20000000000000)) == "353130")
+}
+
+fn hotp_of_rfc_secret(counter: Int) -> Text = totp.hotp(to_bytes("12345678901234567890"), counter)
+
+test "a code is accepted once, within one step of clock drift" {
+let secret = to_bytes("12345678901234567890")
+let moment = 1111111109000
+let step = totp.step_of(moment)
+assert(totp.verify(secret, "081 804", moment, -1) == .Some(step))
+assert(totp.verify(secret, "081804", moment + 30000, -1) == .Some(step))
+assert(totp.verify(secret, "081804", moment + 90000, -1) == .None)
+assert(totp.verify(secret, "081804", moment, step) == .None)
+assert(totp.verify(secret, "81804", moment, -1) == .None)
+assert(totp.verify(secret, "abcdef", moment, -1) == .None)
+}
+
+test "secrets survive Base32" {
+let secret = to_bytes("12345678901234567890")
+assert(totp.base32_encode(secret) == "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
+assert(totp.base32_encode(to_bytes("foobar")) == "MZXW6YTBOI")
+assert(totp.base32_decode("gezd gnbv gy3t qojq gezd gnbv gy3t qojq") == .Some(secret))
+assert(totp.base32_decode("not base32!") == .None)
+assert(totp.grouped("ABCDEFGHIJ") == "ABCD EFGH IJ")
+assert(starts_with(totp.provisioning_uri("Tessera site", "admin", "ABCD"), "otpauth://totp/Tessera%20site:admin?secret=ABCD&issuer=Tessera%20site"))
+}
+
+fn matrix_text(grid: qr.Grid) -> Text {
+var out = ""
+for y in range(0, grid.size) {
+for x in range(0, grid.size) {
+set out += if qr.is_dark(grid, x, y) { "1" } else { "0" }
+}
+}
+out
+}
+
+fn matrix_hash(text: Text) -> Text {
+let grid = qr.encode(text) else return ""
+hex_encode(sha256(to_bytes(matrix_text(grid))))
+}
+
+test "QR codes match a reference encoder module for module" {
+assert(matrix_hash("hello world") == "ff11d03a5d4c7271b10c332b4fa40be7ba354863ec7af342b03e7358f250d276")
+assert(matrix_hash(totp.provisioning_uri("Tessera", "admin", "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")) == "496baf26c1135aa93aa517eebbab18d50f51d5af4d333c519e541e0f29d64dbf")
+let picture = value_or(map_svg(qr.encode("hello")), "")
+assert(starts_with(picture, "<svg class='qr' viewBox='0 0 29 29'"))
+assert(matrix_hash(repeat("z", 214)) == "")
+}
+
+fn map_svg(encoded: Result[qr.Grid, Text]) -> Option[Text] {
+let grid = encoded else return .None
+.Some(qr.svg(grid, "test"))
+}
+
+test "page addresses are checked" {
+assert(manage.slug_problem("news-2026") == .None)
+assert(manage.slug_problem("") != .None)
+assert(manage.slug_problem("News") != .None)
+assert(manage.slug_problem("a/b") != .None)
+assert(manage.slug_problem("-a") != .None)
+assert(manage.slug_problem("admin") != .None)
+assert(manage.is_fixed("home") and manage.is_fixed("404"))
+assert(manage.clean("a\u{D}\nb\u{D}c") == "a\nb\nc")
+}
+
+test "credentials are compared as a whole" {
+assert(auth.credentials_ok("admin", "secret", "admin", "secret"))
+assert(not auth.credentials_ok("admin", "wrong", "admin", "secret"))
+assert(not auth.credentials_ok("other", "secret", "admin", "secret"))
+assert(not auth.credentials_ok("", "", "admin", "secret"))
+}
+
+test "every block kind of the editor can be rendered" {
+for kind in model.kinds() {
+let item = model.Block { id: 1, kind: kind.name, heading: "H", body: "B", extra: "E|/e" }
+let details = model.Page { slug: "k", title: "K", description: "", nav_label: "", nav_order: 0, published: true }
+assert(contains(view.document([:], [], details, [item]), "<section"))
+}
 }

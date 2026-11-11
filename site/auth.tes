@@ -1,0 +1,164 @@
+// Logging in to the admin pages: credentials, sessions and the TOTP second factor.
+//
+// The account is ADMIN_USER / ADMIN_PASSWORD from the environment. A successful login starts a session: a random
+// token in a cookie (HttpOnly, Secure, SameSite=Strict, path /admin), stored in the database only as its SHA-256.
+// With 2FA on, the password alone gives a short-lived session of stage `totp`, which can do nothing but submit a
+// code; a valid code replaces it by a new session of stage `ok`. The TOTP secret lives in `admin_state`.
+
+import std/http
+import store uses db, env, random
+import totp uses nothing
+
+pub type Session {
+key: Text
+stage: Text
+expires: Int
+attempts: Int
+}
+
+pub fn cookie_name() -> Text = "tessera_admin"
+
+note "A full session lasts 12 hours, a session waiting for the code 5 minutes."
+pub fn lifetime(stage: Text) -> Int = if stage == "ok" { 43200000 } else { 300000 }
+
+note "Wrong codes allowed per login before the password must be entered again."
+pub fn max_attempts() -> Int = 5
+
+fn key_of(token: Text) -> Text = hex_encode(sha256(to_bytes(token)))
+
+note "Compares through SHA-256 digests in constant time, so neither the length nor the content of the secret leaks through timing."
+pub fn same(given: Text, expected: Text) -> Bool = equal_constant_time(sha256(to_bytes(given)), sha256(to_bytes(expected)))
+
+note "Both comparisons always run, so the time taken does not tell whether the user name was right."
+pub fn credentials_ok(user: Text, password: Text, expected_user: Text, expected_password: Text) -> Bool {
+let user_ok = same(user, expected_user)
+let password_ok = same(password, expected_password)
+user_ok and password_ok
+}
+
+// ---------- admin_state ----------
+
+pub fn state(connection: Database, name: Text) -> Text uses db {
+let rows = db_query(connection, "SELECT value FROM admin_state WHERE name = ?1", [name]) else return ""
+if length(rows) == 0 {
+return ""
+}
+store.text_of(rows[0], "value")
+}
+
+pub fn set_state(connection: Database, name: Text, value: Text) -> Result[Unit, Text] uses db {
+let _ = try db_execute(connection, "INSERT INTO admin_state (name, value) VALUES (?1, ?2) ON CONFLICT (name) DO UPDATE SET value = excluded.value", [name, value])
+.Ok(())
+}
+
+pub fn clear_state(connection: Database, name: Text) -> Result[Unit, Text] uses db {
+let _ = try db_execute(connection, "DELETE FROM admin_state WHERE name = ?1", [name])
+.Ok(())
+}
+
+// ---------- sessions ----------
+
+note "Starts a session and returns its token, for the cookie. Expired sessions are removed at the same time."
+pub fn start(connection: Database, stage: Text, moment: Int) -> Result[Text, Text] uses db, random {
+let _ = try db_execute(connection, "DELETE FROM sessions WHERE expires <= ?1", [to_text(moment)])
+let token = hex_encode(random_bytes(32))
+let _ = try db_execute(connection, "INSERT INTO sessions (id, stage, created, expires, attempts) VALUES (?1, ?2, ?3, ?4, 0)", [key_of(token), stage, to_text(moment), to_text(moment + lifetime(stage))])
+.Ok(token)
+}
+
+note "The session of the request's cookie, if it exists and has not expired."
+pub fn current(connection: Database, request: http.Request, moment: Int) -> Option[Session] uses db {
+let token = http.cookie(request, cookie_name()) else return .None
+if length(token) != 64 {
+return .None
+}
+let rows = db_query(connection, "SELECT id, stage, expires, attempts FROM sessions WHERE id = ?1 AND expires > ?2", [key_of(token), to_text(moment)]) else return .None
+if length(rows) == 0 {
+return .None
+}
+let row = rows[0]
+.Some(Session { key: store.text_of(row, "id"), stage: store.text_of(row, "stage"), expires: store.number_of(row, "expires"), attempts: store.number_of(row, "attempts") })
+}
+
+pub fn end(connection: Database, session: Session) -> Unit uses db {
+let _ = db_execute(connection, "DELETE FROM sessions WHERE id = ?1", [session.key])
+}
+
+note "Full sessions that have not expired."
+pub fn active_sessions(connection: Database, moment: Int) -> Int uses db {
+let rows = db_query(connection, "SELECT COUNT(*) AS n FROM sessions WHERE stage = 'ok' AND expires > ?1", [to_text(moment)]) else return 0
+if length(rows) == 0 { 0 } else { store.number_of(rows[0], "n") }
+}
+
+pub fn end_all(connection: Database) -> Unit uses db {
+let _ = db_execute(connection, "DELETE FROM sessions", [])
+}
+
+pub fn count_attempt(connection: Database, session: Session) -> Unit uses db {
+let _ = db_execute(connection, "UPDATE sessions SET attempts = attempts + 1 WHERE id = ?1", [session.key])
+}
+
+note "Sets the session cookie; `max_age` 0 removes it. Path /admin and SameSite=Strict keep it away from the public pages and from other sites."
+pub fn with_session_cookie(answer: http.Response, token: Text, max_age: Int) -> http.Response {
+http.with_header(answer, "set-cookie", "\(cookie_name())=\(token); Max-Age=\(max_age); Path=/admin; HttpOnly; Secure; SameSite=Strict")
+}
+
+note "Every form of a session carries this token; a state-changing request without it is refused."
+pub fn csrf_token(connection: Database, session: Session) -> Text uses db = http.csrf_token(state(connection, "session_secret"), session.key)
+
+pub fn csrf_ok(connection: Database, session: Session, given: Text) -> Bool uses db {
+let secret = state(connection, "session_secret")
+secret != "" and http.check_csrf(secret, session.key, given)
+}
+
+// ---------- TOTP ----------
+
+pub fn totp_secret(connection: Database) -> Option[Bytes] uses db {
+let encoded = state(connection, "totp_secret")
+if encoded == "" {
+return .None
+}
+totp.base32_decode(encoded)
+}
+
+pub fn totp_enabled(connection: Database) -> Bool uses db = totp_secret(connection) != .None
+
+fn last_step(connection: Database) -> Int uses db = value_or(parse_int(state(connection, "totp_last_step")), -1)
+
+note "Checks a code against the active secret and remembers its time step, so the same code cannot be used twice."
+pub fn check_code(connection: Database, code: Text, moment: Int) -> Bool uses db {
+let secret = totp_secret(connection) else return false
+let step = totp.verify(secret, code, moment, last_step(connection)) else return false
+let _ = set_state(connection, "totp_last_step", to_text(step))
+true
+}
+
+note "A new random secret (160 bits, as RFC 4226 recommends), waiting for confirmation with a code before it is used."
+pub fn begin_setup(connection: Database) -> Result[Text, Text] uses db, random {
+let secret = totp.base32_encode(random_bytes(20))
+try set_state(connection, "totp_pending", secret)
+.Ok(secret)
+}
+
+pub fn pending_secret(connection: Database) -> Text uses db = state(connection, "totp_pending")
+
+note "Turns 2FA on when `code` is valid for the pending secret."
+pub fn confirm_setup(connection: Database, code: Text, moment: Int) -> Result[Unit, Text] uses db {
+let encoded = pending_secret(connection)
+if encoded == "" {
+return .Error("Start the setup again.")
+}
+let secret = totp.base32_decode(encoded) else return .Error("Start the setup again.")
+let step = totp.verify(secret, code, moment, -1) else return .Error("That code is not valid. Check the time on your phone and try the next code.")
+try store.run_all(connection, [
+store.Step { sql: "INSERT INTO admin_state (name, value) VALUES ('totp_secret', ?1) ON CONFLICT (name) DO UPDATE SET value = excluded.value", params: [encoded] },
+store.Step { sql: "INSERT INTO admin_state (name, value) VALUES ('totp_last_step', ?1) ON CONFLICT (name) DO UPDATE SET value = excluded.value", params: [to_text(step)] },
+store.Step { sql: "DELETE FROM admin_state WHERE name = 'totp_pending'", params: [] }
+])
+.Ok(())
+}
+
+pub fn disable(connection: Database) -> Result[Unit, Text] uses db {
+let _ = try db_execute(connection, "DELETE FROM admin_state WHERE name IN ('totp_secret', 'totp_last_step', 'totp_pending')", [])
+.Ok(())
+}

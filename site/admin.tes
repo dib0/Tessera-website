@@ -1,110 +1,352 @@
-// The admin page: for now it only shows the statistics.
+// The admin pages: login (with optional TOTP), statistics, pages and their blocks, settings and the account.
 //
-// Access uses HTTP Basic authentication. The user name and the password come from the environment variables
-// ADMIN_USER and ADMIN_PASSWORD (set in docker-compose.yml). Without both, the page is disabled. Basic
-// authentication sends the password with every request, so put the site behind HTTPS when it is public.
+// Every request below /admin comes through `respond`. The order of the checks is the security model:
+//   1. the admin is disabled unless ADMIN_USER and ADMIN_PASSWORD are both set;
+//   2. a POST whose Origin is another site is refused;
+//   3. /admin/login and /admin/login/code are the only pages without a full session;
+//   4. every other POST must carry the session's CSRF token.
+// All answers are `no-store` and `noindex`. Put the site behind HTTPS: the session cookie is Secure.
 
 import std/http
-import std/html
+import model uses nothing
 import store uses db, env, random
+import manage uses db, env, random
+import auth uses db, env, random
 import stats uses db
+import totp uses nothing
+import qr uses nothing
 import view uses nothing
+import admin_view uses nothing
 
-fn no_store(answer: http.Response) -> http.Response = http.with_header(http.with_header(answer, "cache-control", "no-store"), "x-robots-tag", "noindex")
-
-fn given_credentials(request: http.Request) -> Option[List[Text]] {
-let line = http.header(request, "authorization") else return .None
-if not starts_with(to_lower(line), "basic ") {
-return .None
-}
-let encoded = trim(slice_text(line, 6, length(line)))
-let raw = base64_decode(encoded) else return .None
-let decoded = from_bytes(raw) else return .None
-let colon = index_of(decoded, ":") else return .None
-.Some([slice_text(decoded, 0, colon), slice_text(decoded, colon + 1, length(decoded))])
-}
-
-note "Compares through SHA-256 digests in constant time, so neither the length nor the content of the secret leaks through timing."
-fn same(given: Text, expected: Text) -> Bool = equal_constant_time(sha256(to_bytes(given)), sha256(to_bytes(expected)))
-
-fn allowed(request: http.Request, user: Text, password: Text) -> Bool {
-let given = given_credentials(request) else return false
-let user_ok = same(given[0], user)
-let password_ok = same(given[1], password)
-user_ok and password_ok
+type Context {
+connection: Database
+site: Map[Text, Text]
+session: auth.Session
+csrf: Text
+fields: Map[Text, Text]
+moment: Int
+user: Text
+password: Text
+notice: Text
 }
 
-// ---------- rendering ----------
+fn no_store(answer: http.Response) -> http.Response = http.with_header(http.with_header(answer, "cache-control", "no-store"), "x-robots-tag", "noindex, nofollow")
 
-fn stat_tile(item: stats.Window) -> Text = "<div class='stat'><b>\(item.views)</b><span>\(html.escape(item.label))</span><br><span>\(item.visitors) visitors</span></div>"
+fn unavailable() -> http.Response = http.text(503, "The database is unavailable.\n")
 
-fn count_row(entry: stats.Count) -> Text = "<tr><td>\(html.escape(entry.label))</td><td class='n'>\(entry.views)</td><td class='n'>\(entry.visitors)</td></tr>"
+fn refused(reason: Text) -> http.Response = http.text(403, "\(reason)\n")
 
-fn count_table(title: Text, first_column: Text, entries: List[stats.Count]) -> Text {
-let body = if length(entries) == 0 { "<tr><td colspan='3' class='muted'>Nothing yet.</td></tr>" } else { join(map(entries, count_row), "") }
-"<section><h2>\(html.escape(title))</h2><table><thead><tr><th>\(html.escape(first_column))</th><th class='n'>Views</th><th class='n'>Visitors</th></tr></thead><tbody>\(body)</tbody></table></section>"
-}
+fn field(fields: Map[Text, Text], name: Text) -> Text = value_or(get(fields, name), "")
 
-note "Bars for the views per day: an inline SVG, so the page needs no script."
-fn chart(days: List[stats.Window]) -> Text {
-let count = length(days)
-if count == 0 {
-return ""
-}
-var peak = 1
-for day in days {
-if day.views > peak {
-set peak = day.views
-}
-}
-let slot = 640 / count
-let bar_width = slot - 12
-var bars: List[Text] = []
-for index in range(0, count) {
-let day = days[index]
-let height = day.views * 110 / peak
-let left = index * slot + 6
-let top = 130 - height
-let tip = "\(day.label): \(day.views) views, \(day.visitors) visitors"
-let caption = slice_text(day.label, 5, 10)
-set bars += ["<rect class='bar-rect' x='\(left)' y='\(top)' width='\(bar_width)' height='\(height)' rx='3'><title>\(html.escape(tip))</title></rect><text x='\(left + bar_width / 2)' y='150'>\(html.escape(caption))</text>"]
-}
-"<svg class='chart' viewBox='0 0 640 160' role='img' aria-label='Page views per day, last 14 days'><line class='axis' x1='0' y1='130' x2='640' y2='130'/>\(join(bars, ""))</svg>"
+fn host_of(origin: Text) -> Text {
+let marker = index_of(origin, "://") else return ""
+to_lower(slice_text(origin, marker + 3, length(origin)))
 }
 
-fn render(site: Map[Text, Text], data: stats.Report) -> Text {
-let since = if data.first_day == "" { "No visits recorded yet." } else { "Counting since \(data.first_day)." }
-let tiles = join(map([data.today, data.week, data.month, data.everything], stat_tile), "")
-let top_pages = count_table("Top pages, last 30 days", "Page", data.pages)
-let top_referrers = count_table("Referrers, last 30 days", "Host", data.referrers)
-let top_browsers = count_table("Browsers, last 30 days", "Browser", data.browsers)
-let not_found = count_table("Not found, last 30 days", "Path", data.missing)
-let intro = "\(html.escape(since)) A visitor is counted once per day. Bots are left out of these numbers; \(data.bot_views) bot views were recorded."
-let inner = "<header class='site'><div class='wrap bar'><a class='brand' href='/'><img src='/assets/img/mark.svg' alt='' width='38' height='38'><span>Tessera admin</span></a><nav class='main' aria-label='Admin'><a href='/'>View site</a></nav></div></header><main id='main'><section class='block'><div class='wrap'><h1>Statistics</h1><p class='intro'>\(intro)</p><div class='stats'>\(tiles)</div><h2>Views per day</h2>\(chart(data.days))</div></section><section class='block'><div class='wrap'><div class='grid2'>\(top_pages)\(top_referrers)\(top_browsers)\(not_found)</div></div></section></main>"
-view.shell(site, "Statistics · Tessera admin", "Site statistics", "noindex, nofollow", inner)
+note "A browser sends Origin with every POST. It must be this site: the Host header, or X-Forwarded-Host behind a proxy that rewrites Host."
+fn same_origin(request: http.Request) -> Bool {
+let origin = http.header(request, "origin") else return true
+let host = host_of(origin)
+let direct = to_lower(value_or(http.header(request, "host"), ""))
+let forwarded = to_lower(trim(split(value_or(http.header(request, "x-forwarded-host"), ""), ",")[0]))
+host != "" and (host == direct or host == forwarded)
 }
 
-// ---------- the request ----------
+fn normalized(path: Text) -> Text = if path != "/admin/" and ends_with(path, "/") { slice_text(path, 0, length(path) - 1) } else if path == "/admin/" { "/admin" } else { path }
+
+fn done_message(code: Text) -> Text {
+match code {
+"saved" => "Saved."
+"created" => "The page was created. It is a draft until you publish it."
+"deleted" => "Deleted."
+"added" => "Block added at the end of the page."
+"moved" => "Block moved."
+"totp-on" => "Two-factor authentication is on. You need a code from now on when you log in."
+"totp-off" => "Two-factor authentication is off."
+_ => ""
+}
+}
 
 pub fn respond(request: http.Request) -> http.Response uses db, env, log, random, time {
 let user = environment_variable("ADMIN_USER")
 let password = environment_variable("ADMIN_PASSWORD")
 if user == "" or password == "" {
-return no_store(http.text(503, "The admin page is disabled: set ADMIN_USER and ADMIN_PASSWORD.\n"))
+return no_store(http.text(503, "The admin pages are disabled: set ADMIN_USER and ADMIN_PASSWORD.\n"))
 }
-if not allowed(request, user, password) {
+let posting = request.method == "POST"
+if not posting and request.method != "GET" and request.method != "HEAD" {
+return no_store(http.with_header(http.text(405, "method not allowed\n"), "allow", "GET, HEAD, POST"))
+}
+if posting and not same_origin(request) {
+log("warn", "refused cross-site admin POST from \(request.remote_address)")
+return no_store(refused("Cross-site request refused."))
+}
+let connection = store.open() else return no_store(unavailable())
+let site = store.load_settings(connection)
+let moment = now()
+let session = auth.current(connection, request, moment)
+let path = normalized(request.path)
+if path == "/admin/login" {
+return no_store(if posting { log_in(connection, site, request, session, user, password, moment) } else { login_form(site, session) })
+}
+let active = session else return no_store(to_login(posting))
+let fields: Map[Text, Text] = if posting { http.form(request) } else { [:] }
+if posting and not auth.csrf_ok(connection, active, field(fields, "csrf")) {
+return no_store(refused("The form has expired. Go back, reload the page and try again."))
+}
+let csrf = auth.csrf_token(connection, active)
+if path == "/admin/logout" and posting {
+auth.end(connection, active)
+return no_store(auth.with_session_cookie(http.redirect("/admin/login"), "", 0))
+}
+if active.stage == "totp" {
+if path != "/admin/login/code" {
+return no_store(http.redirect("/admin/login/code"))
+}
+return no_store(if posting { check_code(connection, site, request, active, field(fields, "code"), moment) } else { http.html(200, admin_view.code_page(site, csrf, "")) })
+}
+if active.stage != "ok" or path == "/admin/login/code" {
+return no_store(to_login(posting))
+}
+let context = Context { connection: connection, site: site, session: active, csrf: csrf, fields: fields, moment: moment, user: user, password: password, notice: done_message(value_or(get(request.query, "done"), "")) }
+no_store(route(context, path, posting))
+}
+
+fn to_login(posting: Bool) -> http.Response = if posting { refused("Your session has ended. Log in again.") } else { http.redirect("/admin/login") }
+
+// ---------- logging in ----------
+
+fn login_form(site: Map[Text, Text], session: Option[auth.Session]) -> http.Response {
+let current = session else return http.html(200, admin_view.login_page(site, "", ""))
+if current.stage == "ok" {
+return http.redirect("/admin")
+}
+http.html(200, admin_view.login_page(site, "", ""))
+}
+
+fn log_in(connection: Database, site: Map[Text, Text], request: http.Request, session: Option[auth.Session], user: Text, password: Text, moment: Int) -> http.Response uses db, log, random, time {
+let fields = http.form(request)
+let given_user = field(fields, "user")
+if not auth.credentials_ok(given_user, field(fields, "password"), user, password) {
 sleep(750)
 log("warn", "rejected admin login from \(request.remote_address)")
-let challenge = http.with_header(http.text(401, "Authentication required.\n"), "www-authenticate", "Basic realm=\"Tessera admin\", charset=\"UTF-8\"")
-return no_store(challenge)
+return http.html(401, admin_view.login_page(site, given_user, "The user name or the password is not correct."))
 }
-if request.path != "/admin" and request.path != "/admin/" {
-return no_store(http.not_found())
+match session {
+.Some(old) => auth.end(connection, old)
+.None => {}
 }
-if request.method != "GET" and request.method != "HEAD" {
-return no_store(http.with_header(http.text(405, "method not allowed\n"), "allow", "GET, HEAD"))
+let stage = if auth.totp_enabled(connection) { "totp" } else { "ok" }
+let token = auth.start(connection, stage, moment) else return unavailable()
+let target = if stage == "ok" { "/admin" } else { "/admin/login/code" }
+auth.with_session_cookie(http.redirect(target), token, auth.lifetime(stage) / 1000)
 }
-let connection = store.open() else return no_store(http.text(503, "The database is unavailable.\n"))
-let data = stats.report(connection, now())
-no_store(http.html(200, render(store.load_settings(connection), data)))
+
+note "The second step. A good code replaces the waiting session by a new full one (a new token, so a token seen before the code was entered is worthless); too many wrong codes end it."
+fn check_code(connection: Database, site: Map[Text, Text], request: http.Request, session: auth.Session, code: Text, moment: Int) -> http.Response uses db, log, random, time {
+if session.attempts >= auth.max_attempts() {
+auth.end(connection, session)
+return auth.with_session_cookie(http.html(429, admin_view.login_page(site, "", "Too many wrong codes. Log in again.")), "", 0)
+}
+if auth.check_code(connection, code, moment) {
+auth.end(connection, session)
+let token = auth.start(connection, "ok", moment) else return unavailable()
+return auth.with_session_cookie(http.redirect("/admin"), token, auth.lifetime("ok") / 1000)
+}
+auth.count_attempt(connection, session)
+sleep(750)
+log("warn", "rejected admin 2FA code from \(request.remote_address)")
+http.html(401, admin_view.code_page(site, auth.csrf_token(connection, session), "That code is not valid. Wait for the next code and try again."))
+}
+
+// ---------- routing ----------
+
+fn route(c: Context, path: Text, posting: Bool) -> http.Response uses db, random, time {
+if path == "/admin" {
+return if posting { not_allowed() } else { page(c, "Statistics", "statistics", admin_view.statistics(stats.report(c.connection, c.moment))) }
+}
+if path == "/admin/pages" {
+return if posting { create_page(c) } else { pages_list(c, "", "", "") }
+}
+if path == "/admin/settings" {
+return if posting { save_settings(c) } else { settings(c, "") }
+}
+if path == "/admin/account" {
+return if posting { not_allowed() } else { account(c, "") }
+}
+if starts_with(path, "/admin/account/") {
+return if posting { account_action(c, slice_text(path, 15, length(path))) } else { not_allowed() }
+}
+match http.match_path("/admin/pages/:slug", path) {
+.Some(parameters) => return if posting { save_page(c, value_or(get(parameters, "slug"), "")) } else { editor(c, value_or(get(parameters, "slug"), ""), "") }
+.None => {}
+}
+match http.match_path("/admin/pages/:slug/:action", path) {
+.Some(parameters) => return page_action(c, value_or(get(parameters, "slug"), ""), value_or(get(parameters, "action"), ""), posting)
+.None => {}
+}
+match http.match_path("/admin/blocks/:id", path) {
+.Some(parameters) => return if posting { block_action(c, value_or(get(parameters, "id"), ""), "save") } else { not_allowed() }
+.None => {}
+}
+match http.match_path("/admin/blocks/:id/:action", path) {
+.Some(parameters) => return if posting { block_action(c, value_or(get(parameters, "id"), ""), value_or(get(parameters, "action"), "")) } else { not_allowed() }
+.None => {}
+}
+missing(c)
+}
+
+fn page(c: Context, title: Text, section: Text, inner: Text) -> http.Response = http.html(200, admin_view.layout(c.site, title, section, c.csrf, inner))
+
+fn failed(c: Context, title: Text, section: Text, inner: Text) -> http.Response = http.html(422, admin_view.layout(c.site, title, section, c.csrf, inner))
+
+fn not_allowed() -> http.Response = http.with_header(http.text(405, "method not allowed\n"), "allow", "GET, HEAD")
+
+fn missing(c: Context) -> http.Response = http.html(404, admin_view.layout(c.site, "Not found", "", c.csrf, "<section class='block'><div class='wrap narrow'><h1>Not found</h1><p>There is nothing here. <a href='/admin/pages'>Back to the pages</a>.</p></div></section>"))
+
+fn back_to(slug: Text, done: Text, anchor: Text) -> http.Response = http.redirect("/admin/pages/\(slug)?done=\(done)\(anchor)")
+
+// ---------- pages ----------
+
+fn pages_list(c: Context, problem: Text, slug: Text, title: Text) -> http.Response uses db {
+let inner = admin_view.pages_list(manage.all_pages(c.connection), c.csrf, c.notice, problem, slug, title)
+if problem == "" { page(c, "Pages", "pages", inner) } else { failed(c, "Pages", "pages", inner) }
+}
+
+fn create_page(c: Context) -> http.Response uses db {
+let slug = trim(field(c.fields, "slug"))
+let title = field(c.fields, "title")
+match manage.create_page(c.connection, slug, title) {
+.Ok(_) => back_to(slug, "created", "")
+.Error(problem) => pages_list(c, problem, slug, title)
+}
+}
+
+fn editor(c: Context, slug: Text, problem: Text) -> http.Response uses db {
+let found = manage.find_page(c.connection, slug) else return missing(c)
+page(c, found.title, "pages", admin_view.page_editor(found, slug, store.page_blocks(c.connection, slug), c.csrf, c.notice, problem))
+}
+
+fn save_page(c: Context, slug: Text) -> http.Response uses db {
+let found = manage.find_page(c.connection, slug) else return missing(c)
+let position = parse_int(trim(field(c.fields, "nav_order")))
+let changed = found with { slug: if manage.is_fixed(slug) { slug } else { trim(field(c.fields, "slug")) }, title: field(c.fields, "title"), description: manage.clean(field(c.fields, "description")), nav_label: field(c.fields, "nav_label"), nav_order: value_or(position, -1), published: field(c.fields, "published") == "1" }
+let outcome = if position == .None { .Error("The menu position must be a whole number.") } else { manage.update_page(c.connection, slug, changed) }
+match outcome {
+.Ok(_) => back_to(changed.slug, "saved", "")
+.Error(problem) => failed(c, found.title, "pages", admin_view.page_editor(changed, slug, store.page_blocks(c.connection, slug), c.csrf, "", problem))
+}
+}
+
+fn page_action(c: Context, slug: Text, action: Text, posting: Bool) -> http.Response uses db {
+let found = manage.find_page(c.connection, slug) else return missing(c)
+if action == "preview" and not posting {
+let menu = store.site_pages(c.connection, slug).navigation
+return http.html(200, view.document(c.site, menu, found, store.page_blocks(c.connection, slug)))
+}
+if not posting {
+return not_allowed()
+}
+if action == "delete" {
+return match manage.delete_page(c.connection, slug) {
+.Ok(_) => http.redirect("/admin/pages?done=deleted")
+.Error(problem) => editor(c, slug, problem)
+}
+}
+if action == "blocks" {
+return match manage.add_block(c.connection, slug, field(c.fields, "kind")) {
+.Ok(id) => back_to(slug, "added", "#block-\(id)")
+.Error(problem) => editor(c, slug, problem)
+}
+}
+missing(c)
+}
+
+fn block_action(c: Context, id_text: Text, action: Text) -> http.Response uses db {
+let id = parse_int(id_text) else return missing(c)
+let slug = manage.page_of_block(c.connection, id) else return missing(c)
+let changed = model.Block { id: id, kind: field(c.fields, "kind"), heading: field(c.fields, "heading"), body: field(c.fields, "body"), extra: field(c.fields, "extra") }
+let outcome = match action {
+"save" => manage.update_block(c.connection, changed)
+"up" => manage.move_block(c.connection, id, true)
+"down" => manage.move_block(c.connection, id, false)
+"delete" => manage.delete_block(c.connection, id)
+_ => return missing(c)
+}
+let done = match action {
+"save" => "saved"
+"delete" => "deleted"
+_ => "moved"
+}
+let anchor = if action == "delete" { "" } else { "#block-\(id)" }
+match outcome {
+.Ok(_) => back_to(slug, done, anchor)
+.Error(problem) => editor(c, slug, problem)
+}
+}
+
+// ---------- settings ----------
+
+fn settings(c: Context, problem: Text) -> http.Response {
+let inner = admin_view.settings_page(c.site, c.csrf, c.notice, problem)
+if problem == "" { page(c, "Settings", "settings", inner) } else { failed(c, "Settings", "settings", inner) }
+}
+
+fn save_settings(c: Context) -> http.Response uses db {
+match manage.save_settings(c.connection, c.fields) {
+.Ok(_) => http.redirect("/admin/settings?done=saved")
+.Error(problem) => settings(c, problem)
+}
+}
+
+// ---------- account and 2FA ----------
+
+fn account(c: Context, problem: Text) -> http.Response uses db {
+let pending = auth.pending_secret(c.connection)
+let issuer = value_or(get(c.site, "site_name"), "Tessera")
+let uri = if pending == "" { "" } else { totp.provisioning_uri(issuer, c.user, pending) }
+let picture = match qr.encode(uri) {
+.Ok(grid) => qr.svg(grid, "QR code for your authenticator app")
+.Error(_) => "<p class='muted'>The QR code does not fit; type the key by hand.</p>"
+}
+let details = admin_view.Account { user: c.user, enabled: auth.totp_enabled(c.connection), pending: totp.grouped(pending), qr: picture, uri: uri, sessions: auth.active_sessions(c.connection, c.moment) }
+let inner = admin_view.account_page(details, c.csrf, c.notice, problem)
+if problem == "" { page(c, "Account", "account", inner) } else { failed(c, "Account", "account", inner) }
+}
+
+fn account_action(c: Context, action: Text) -> http.Response uses db, random, time {
+match action {
+"totp/start" => {
+if auth.totp_enabled(c.connection) {
+return account(c, "Two-factor authentication is already on.")
+}
+match auth.begin_setup(c.connection) {
+.Ok(_) => http.redirect("/admin/account")
+.Error(problem) => account(c, problem)
+}
+}
+"totp/cancel" => {
+let _ = auth.clear_state(c.connection, "totp_pending")
+http.redirect("/admin/account")
+}
+"totp/confirm" => match auth.confirm_setup(c.connection, field(c.fields, "code"), c.moment) {
+.Ok(_) => http.redirect("/admin/account?done=totp-on")
+.Error(problem) => account(c, problem)
+}
+"totp/disable" => {
+if not auth.same(field(c.fields, "password"), c.password) or not auth.check_code(c.connection, field(c.fields, "code"), c.moment) {
+sleep(750)
+return account(c, "The password or the code is not correct.")
+}
+match auth.disable(c.connection) {
+.Ok(_) => http.redirect("/admin/account?done=totp-off")
+.Error(problem) => account(c, problem)
+}
+}
+"logout-all" => {
+auth.end_all(c.connection)
+auth.with_session_cookie(http.redirect("/admin/login"), "", 0)
+}
+_ => missing(c)
+}
 }

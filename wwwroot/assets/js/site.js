@@ -195,8 +195,17 @@
     });
   }
 
+  /* ---------- admin: ask before deleting ---------- */
+  function enhanceConfirm() {
+    document.addEventListener('click', function (event) {
+      var button = event.target.closest && event.target.closest('[data-confirm]');
+      if (button && !window.confirm(button.getAttribute('data-confirm'))) event.preventDefault();
+    });
+  }
+
   if (typeof document !== 'undefined' && document.addEventListener) {
     var start = function () {
+      enhanceConfirm();
       enhanceHeader();
       enhanceCode();
       enhanceReveal();

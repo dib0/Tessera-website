@@ -221,7 +221,7 @@ set links += [anchor(html.escape(cell(cells, 0)), html.escape(wanted))]
 "<div class='strip' aria-hidden='true'><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><footer class='site'><div class='wrap'><img src='/assets/img/mark.svg' alt='' width='54' height='54'><div><p>\(inline(setting(site, "footer_text", "")))</p><p class='links'>\(join(links, ""))</p></div></div></footer>"
 }
 
-note "A complete HTML document around `inner`. Used for the pages and for the admin page."
+note "A complete HTML document around `inner`. Used for the pages and for the admin pages."
 pub fn shell(site: Map[Text, Text], title: Text, description: Text, robots: Text, inner: Text) -> Text {
 let language = html.escape(setting(site, "language", "en"))
 let head = "<meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><meta name='robots' content='\(html.escape(robots))'><title>\(html.escape(title))</title><meta name='description' content='\(html.escape(description))'><link rel='icon' type='image/svg+xml' href='/assets/img/mark.svg'><link rel='stylesheet' href='/assets/css/site.css'><script src='/assets/js/theme.js'></script><script src='/assets/js/site.js' defer></script>"
@@ -231,10 +231,6 @@ let head = "<meta charset='utf-8'><meta name='viewport' content='width=device-wi
 pub fn document(site: Map[Text, Text], navigation: List[model.Page], current: model.Page, items: List[model.Block]) -> Text {
 let name = setting(site, "site_name", "Tessera")
 let title = if current.slug == "home" { "\(name): \(setting(site, "tagline", ""))" } else { "\(current.title) · \(name)" }
-var body: List[Text] = []
-for item in items {
-set body += [block_html(item)]
-}
-let inner = "\(header_html(site, navigation, current.slug))\n<main id='main'>\n\(join(body, "\n"))\n</main>\n\(footer_html(site))"
+let inner = "\(header_html(site, navigation, current.slug))\n<main id='main'>\n\(join(map(items, block_html), "\n"))\n</main>\n\(footer_html(site))"
 shell(site, title, current.description, "index, follow", inner)
 }

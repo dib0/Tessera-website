@@ -3,7 +3,7 @@
 #   cp .env.example .env     # then choose ADMIN_USER and ADMIN_PASSWORD
 #   docker compose up -d --build
 #
-# Site:  http://localhost:8080/      Admin (statistics):  http://localhost:8080/admin
+# Site:  http://localhost:8080/      Admin (statistics, pages, settings, 2FA):  http://localhost:8080/admin
 
 services:
   site:
@@ -18,7 +18,7 @@ services:
     ports:
       - "${PORT:-8080}:8080"
     environment:
-      # The credentials of the admin page. Without both, the admin page is disabled.
+      # The admin account. Without both, the admin pages are disabled.
       ADMIN_USER: ${ADMIN_USER:?set ADMIN_USER in .env}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
     volumes:

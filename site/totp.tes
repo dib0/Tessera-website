@@ -1,0 +1,192 @@
+// Time-based one-time passwords (RFC 6238) for the admin login. Pure: the caller passes the time and the secret.
+//
+// Authenticator apps (Google Authenticator, Aegis, 1Password, ...) all support HMAC-SHA-1 with 6 digits and 30-second
+// steps, and many support nothing else, so that is what this module implements. The runtime only has SHA-256, so
+// SHA-1 (RFC 3174) and HMAC (RFC 2104) are written out here, with the test vectors of the RFCs in main.tes.
+
+import std/url
+
+fn word(x: Int) -> Int = bit_and(x, 4294967295)
+
+fn rotate(x: Int, n: Int) -> Int = bit_or(word(shift_left(x, n)), shift_right(x, 32 - n))
+
+fn big_endian(value: Int, count: Int) -> List[Int] {
+var out: List[Int] = []
+for index in range(0, count) {
+set out += [bit_and(shift_right(value, (count - 1 - index) * 8), 255)]
+}
+out
+}
+
+fn round_function(t: Int, b: Int, c: Int, d: Int) -> Int {
+if t < 20 {
+return bit_or(bit_and(b, c), bit_and(bit_xor(b, 4294967295), d))
+}
+if t >= 40 and t < 60 {
+return bit_or(bit_or(bit_and(b, c), bit_and(b, d)), bit_and(c, d))
+}
+bit_xor(bit_xor(b, c), d)
+}
+
+fn round_constant(t: Int) -> Int {
+if t < 20 {
+return 1518500249
+}
+if t < 40 {
+return 1859775393
+}
+if t < 60 {
+return 2400959708
+}
+3395469782
+}
+
+note "SHA-1 (RFC 3174). Only for HMAC-SHA-1 in TOTP, where its collision weakness does not matter; use sha256 for anything else."
+pub fn sha1(data: Bytes) -> Bytes {
+var message = byte_values(data)
+let bit_length = length(message) * 8
+set message += [128]
+while length(message) % 64 != 56 {
+set message += [0]
+}
+set message += big_endian(bit_length, 8)
+var h = [1732584193, 4023233417, 2562383102, 271733878, 3285377520]
+var w = repeat([0], 80)
+for chunk in range(0, length(message) / 64) {
+for t in range(0, 16) {
+let at = chunk * 64 + t * 4
+set w[t] = bit_or(bit_or(shift_left(message[at], 24), shift_left(message[at + 1], 16)), bit_or(shift_left(message[at + 2], 8), message[at + 3]))
+}
+for t in range(16, 80) {
+set w[t] = rotate(bit_xor(bit_xor(w[t - 3], w[t - 8]), bit_xor(w[t - 14], w[t - 16])), 1)
+}
+var a = h[0]
+var b = h[1]
+var c = h[2]
+var d = h[3]
+var e = h[4]
+for t in range(0, 80) {
+let next = word(rotate(a, 5) + round_function(t, b, c, d) + e + round_constant(t) + w[t])
+set e = d
+set d = c
+set c = rotate(b, 30)
+set b = a
+set a = next
+}
+set h[0] = word(h[0] + a)
+set h[1] = word(h[1] + b)
+set h[2] = word(h[2] + c)
+set h[3] = word(h[3] + d)
+set h[4] = word(h[4] + e)
+}
+var digest: List[Int] = []
+for part in h {
+set digest += big_endian(part, 4)
+}
+bytes(digest)
+}
+
+fn xor_pad(key: List[Int], pad: Int) -> List[Int] {
+var out: List[Int] = []
+for value in key {
+set out += [bit_xor(value, pad)]
+}
+out
+}
+
+note "HMAC-SHA-1 (RFC 2104) with SHA-1's 64-byte block."
+pub fn hmac_sha1(key: Bytes, message: Bytes) -> Bytes {
+var block = if length(key) > 64 { byte_values(sha1(key)) } else { byte_values(key) }
+set block += repeat([0], 64 - length(block))
+let inner = sha1(bytes(xor_pad(block, 54)) + message)
+sha1(bytes(xor_pad(block, 92)) + inner)
+}
+
+note "The 6-digit HOTP value (RFC 4226) of a counter."
+pub fn hotp(secret: Bytes, counter: Int) -> Text {
+let digest = hmac_sha1(secret, bytes(big_endian(counter, 8)))
+let offset = bit_and(digest[19], 15)
+let binary = bit_or(bit_or(shift_left(bit_and(digest[offset], 127), 24), shift_left(digest[offset + 1], 16)), bit_or(shift_left(digest[offset + 2], 8), digest[offset + 3]))
+pad_left(to_text(binary % 1000000), 6, "0")
+}
+
+note "The 30-second time step of a moment in milliseconds since 1970."
+pub fn step_of(moment: Int) -> Int = moment / 30000
+
+fn only_digits(code: Text) -> Text = replace(replace(trim(code), " ", ""), "-", "")
+
+note "Checks a code against the current step and one step on either side (clock drift). Returns the matching step, which the caller stores: a step at or before `last_used` is refused, so a code cannot be used twice."
+pub fn verify(secret: Bytes, code: Text, moment: Int, last_used: Int) -> Option[Int] {
+let given = only_digits(code)
+if length(given) != 6 or parse_int(given) == .None {
+return .None
+}
+let current = step_of(moment)
+var found: Option[Int] = .None
+for step in [current - 1, current, current + 1] {
+if step > last_used and equal_constant_time(to_bytes(hotp(secret, step)), to_bytes(given)) {
+set found = .Some(step)
+}
+}
+found
+}
+
+// ---------- Base32 (RFC 4648), the format authenticator apps use for secrets ----------
+
+fn alphabet() -> List[Text] = split("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", "")
+
+pub fn base32_encode(data: Bytes) -> Text {
+let letters = alphabet()
+var out = ""
+var buffer = 0
+var count = 0
+for value in byte_values(data) {
+set buffer = bit_or(shift_left(bit_and(buffer, 255), 8), value)
+set count += 8
+while count >= 5 {
+set out += letters[bit_and(shift_right(buffer, count - 5), 31)]
+set count -= 5
+}
+}
+if count > 0 {
+set out += letters[bit_and(shift_left(buffer, 5 - count), 31)]
+}
+out
+}
+
+note "Decodes Base32, ignoring case, spaces and `=` padding; `.None` for any other character."
+pub fn base32_decode(text: Text) -> Option[Bytes] {
+let letters = alphabet()
+var out: List[Int] = []
+var buffer = 0
+var count = 0
+for piece in split(to_upper(replace(replace(text, " ", ""), "=", "")), "") {
+let value = index_of(letters, piece) else return .None
+set buffer = bit_or(shift_left(bit_and(buffer, 255), 5), value)
+set count += 5
+if count >= 8 {
+set out += [bit_and(shift_right(buffer, count - 8), 255)]
+set count -= 8
+}
+}
+.Some(bytes(out))
+}
+
+note "The secret in groups of four letters, easier to type by hand."
+pub fn grouped(secret: Text) -> Text {
+let letters = split(secret, "")
+var out = ""
+for index in range(0, length(letters)) {
+if index > 0 and index % 4 == 0 {
+set out += " "
+}
+set out += letters[index]
+}
+out
+}
+
+note "The otpauth:// address that authenticator apps read from a QR code."
+pub fn provisioning_uri(issuer: Text, account: Text, secret: Text) -> Text {
+let label = "\(url.percent_encode(issuer)):\(url.percent_encode(account))"
+"otpauth://totp/\(label)?secret=\(secret)&issuer=\(url.percent_encode(issuer))&algorithm=SHA1&digits=6&period=30"
+}

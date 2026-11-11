@@ -1,0 +1,197 @@
+// Changes to the content, made from the admin pages: pages, their blocks and the site settings.
+//
+// Every change is checked here before it reaches the database (slugs, kinds, numbers), and changes that touch more
+// than one row run in one transaction. Rendering never trusts the content anyway: view.tes escapes everything.
+
+import model uses nothing
+import store uses db, env, random
+
+pub type PageSummary {
+page: model.Page
+blocks: Int
+}
+
+fn summary_from(row: Map[Text, Text]) -> PageSummary = PageSummary { page: store.page_from(row), blocks: store.number_of(row, "block_count") }
+
+note "All pages, published or not: the menu pages in menu order first, then the others by slug."
+pub fn all_pages(connection: Database) -> List[PageSummary] uses db {
+let rows = db_query(connection, "SELECT p.slug, p.title, p.description, p.nav_label, p.nav_order, p.published, (SELECT COUNT(*) FROM blocks b WHERE b.page_slug = p.slug) AS block_count FROM pages p ORDER BY p.nav_order = 0, p.nav_order, p.slug", []) else return []
+map(rows, summary_from)
+}
+
+pub fn find_page(connection: Database, slug: Text) -> Option[model.Page] uses db {
+let rows = db_query(connection, "SELECT slug, title, description, nav_label, nav_order, published FROM pages WHERE slug = ?1", [slug]) else return .None
+if length(rows) == 0 {
+return .None
+}
+.Some(store.page_from(rows[0]))
+}
+
+note "The page a block belongs to."
+pub fn page_of_block(connection: Database, id: Int) -> Option[Text] uses db {
+let rows = db_query(connection, "SELECT page_slug FROM blocks WHERE id = ?1", [to_text(id)]) else return .None
+if length(rows) == 0 {
+return .None
+}
+.Some(store.text_of(rows[0], "page_slug"))
+}
+
+// ---------- validation (pure) ----------
+
+note "Pages with a fixed role: `home` is served at /, `404` for unknown addresses. They cannot be renamed or deleted."
+pub fn is_fixed(slug: Text) -> Bool = slug == "home" or slug == "404"
+
+fn slug_character(piece: Text) -> Bool = contains("abcdefghijklmnopqrstuvwxyz0123456789-", piece)
+
+note "A slug is the address of a page: 1 to 60 lowercase letters, digits and dashes, not starting or ending with a dash, and not an address the site uses itself."
+pub fn slug_problem(slug: Text) -> Option[Text] {
+if slug == "" or length(slug) > 60 {
+return .Some("The address must be 1 to 60 characters long.")
+}
+if length(filter(split(slug, ""), slug_character)) != length(slug) {
+return .Some("The address may only contain lowercase letters, digits and dashes.")
+}
+if starts_with(slug, "-") or ends_with(slug, "-") {
+return .Some("The address cannot start or end with a dash.")
+}
+if contains(["admin", "assets", "healthz"], slug) {
+return .Some("This address is used by the site itself.")
+}
+.None
+}
+
+note "Form text uses CRLF line breaks; the database stores LF only, like the seed content."
+pub fn clean(text: Text) -> Text = replace(replace(text, "\u{D}\n", "\n"), "\u{D}", "\n")
+
+// ---------- pages ----------
+
+pub fn create_page(connection: Database, slug: Text, title: Text) -> Result[Unit, Text] uses db {
+let problem = slug_problem(slug)
+if problem != .None {
+return .Error(value_or(problem, ""))
+}
+if find_page(connection, slug) != .None {
+return .Error("A page with this address already exists.")
+}
+let name = if trim(title) == "" { slug } else { trim(title) }
+let _ = try db_execute(connection, "INSERT INTO pages (slug, title, description, nav_label, nav_order, published) VALUES (?1, ?2, '', ?2, 0, 0)", [slug, name])
+.Ok(())
+}
+
+note "Saves the details of page `slug`. A new slug renames the page and moves its blocks with it, in one transaction."
+pub fn update_page(connection: Database, slug: Text, changed: model.Page) -> Result[Unit, Text] uses db {
+if trim(changed.title) == "" {
+return .Error("The title cannot be empty.")
+}
+if changed.nav_order < 0 or changed.nav_order > 10000 {
+return .Error("The menu position must be between 0 and 10000.")
+}
+var steps: List[store.Step] = []
+if changed.slug != slug {
+if is_fixed(slug) {
+return .Error("The address of this page cannot change.")
+}
+let problem = slug_problem(changed.slug)
+if problem != .None {
+return .Error(value_or(problem, ""))
+}
+if find_page(connection, changed.slug) != .None {
+return .Error("A page with this address already exists.")
+}
+set steps += [store.Step { sql: "UPDATE blocks SET page_slug = ?1 WHERE page_slug = ?2", params: [changed.slug, slug] }]
+}
+let flag = if changed.published or is_fixed(slug) { "1" } else { "0" }
+set steps += [store.Step { sql: "UPDATE pages SET slug = ?1, title = ?2, description = ?3, nav_label = ?4, nav_order = ?5, published = ?6 WHERE slug = ?7", params: [changed.slug, trim(changed.title), trim(changed.description), trim(changed.nav_label), to_text(changed.nav_order), flag, slug] }]
+store.run_all(connection, steps)
+}
+
+pub fn delete_page(connection: Database, slug: Text) -> Result[Unit, Text] uses db {
+if is_fixed(slug) {
+return .Error("This page cannot be deleted.")
+}
+store.run_all(connection, [store.Step { sql: "DELETE FROM blocks WHERE page_slug = ?1", params: [slug] }, store.Step { sql: "DELETE FROM pages WHERE slug = ?1", params: [slug] }])
+}
+
+// ---------- blocks ----------
+
+note "Adds an empty block at the end of the page and returns its id."
+pub fn add_block(connection: Database, slug: Text, kind: Text) -> Result[Int, Text] uses db {
+if not model.is_kind(kind) {
+return .Error("Unknown block kind.")
+}
+let _ = try db_execute(connection, "INSERT INTO blocks (page_slug, sort_order, kind) SELECT ?1, COALESCE(MAX(sort_order), -1) + 1, ?2 FROM blocks WHERE page_slug = ?1", [slug, kind])
+let rows = try db_query(connection, "SELECT last_insert_rowid() AS id", [])
+if length(rows) == 0 {
+return .Error("The new block has no id.")
+}
+.Ok(store.number_of(rows[0], "id"))
+}
+
+pub fn update_block(connection: Database, changed: model.Block) -> Result[Unit, Text] uses db {
+if not model.is_kind(changed.kind) {
+return .Error("Unknown block kind.")
+}
+let _ = try db_execute(connection, "UPDATE blocks SET kind = ?1, heading = ?2, body = ?3, extra = ?4 WHERE id = ?5", [changed.kind, clean(changed.heading), clean(changed.body), clean(changed.extra), to_text(changed.id)])
+.Ok(())
+}
+
+pub fn delete_block(connection: Database, id: Int) -> Result[Unit, Text] uses db {
+let _ = try db_execute(connection, "DELETE FROM blocks WHERE id = ?1", [to_text(id)])
+.Ok(())
+}
+
+note "Swaps a block with its neighbour above (`up`) or below. (page_slug, sort_order) is unique, so the swap goes through a temporary negative position, in one transaction."
+pub fn move_block(connection: Database, id: Int, up: Bool) -> Result[Unit, Text] uses db {
+let rows = try db_query(connection, "SELECT page_slug, sort_order FROM blocks WHERE id = ?1", [to_text(id)])
+if length(rows) == 0 {
+return .Error("This block does not exist.")
+}
+let slug = store.text_of(rows[0], "page_slug")
+let position = store.text_of(rows[0], "sort_order")
+let sql = if up { "SELECT id, sort_order FROM blocks WHERE page_slug = ?1 AND sort_order < ?2 ORDER BY sort_order DESC LIMIT 1" } else { "SELECT id, sort_order FROM blocks WHERE page_slug = ?1 AND sort_order > ?2 ORDER BY sort_order LIMIT 1" }
+let others = try db_query(connection, sql, [slug, position])
+if length(others) == 0 {
+return .Ok(())
+}
+let other = store.text_of(others[0], "id")
+let other_position = store.text_of(others[0], "sort_order")
+let parking = to_text(-1 - id)
+store.run_all(connection, [
+store.Step { sql: "UPDATE blocks SET sort_order = ?1 WHERE id = ?2", params: [parking, to_text(id)] },
+store.Step { sql: "UPDATE blocks SET sort_order = ?1 WHERE id = ?2", params: [position, other] },
+store.Step { sql: "UPDATE blocks SET sort_order = ?1 WHERE id = ?2", params: [other_position, to_text(id)] }
+])
+}
+
+// ---------- settings ----------
+
+pub type Field {
+name: Text
+label: Text
+help: Text
+multiline: Bool
+}
+
+note "The settings the admin may edit. Other rows of `settings` (such as stats_salt) are internal."
+pub fn setting_fields() -> List[Field] {
+[
+Field { name: "site_name", label: "Site name", help: "Shown in the header and in page titles.", multiline: false },
+Field { name: "tagline", label: "Tagline", help: "Part of the title of the home page.", multiline: false },
+Field { name: "language", label: "Language", help: "The lang attribute of every page, such as en or nl.", multiline: false },
+Field { name: "github_url", label: "GitHub address", help: "The GitHub button in the header.", multiline: false },
+Field { name: "footer_text", label: "Footer text", help: "`code` and [label](url) links work here.", multiline: true },
+Field { name: "footer_links", label: "Footer links", help: "One per line: label|url", multiline: true }
+]
+}
+
+fn field_name(field: Field) -> Text = field.name
+
+pub fn save_settings(connection: Database, values: Map[Text, Text]) -> Result[Unit, Text] uses db {
+var steps: List[store.Step] = []
+for name in keys(values) {
+if contains(map(setting_fields(), field_name), name) {
+set steps += [store.Step { sql: "INSERT INTO settings (name, value) VALUES (?1, ?2) ON CONFLICT (name) DO UPDATE SET value = excluded.value", params: [name, trim(clean(value_or(get(values, name), "")))] }]
+}
+}
+store.run_all(connection, steps)
+}

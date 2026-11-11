@@ -1,7 +1,8 @@
-// The SQLite side of the site: the schema, the first-run seeding and the queries behind the pages.
+// The SQLite side of the site: the schema and its upgrades, the first-run seeding, and the queries behind the pages.
 //
-// The database holds the texts and the page structure (settings, pages, blocks) and the statistics (hits).
-// When the database is empty, `open` fills it from `content`; from then on the database is the only source.
+// The database holds the texts and the page structure (settings, pages, blocks), the statistics (hits) and the
+// admin state (sessions, admin_state). When the database is empty, `open` fills it from `content`; from then on the
+// database is the only source, edited through the admin pages.
 
 import model uses nothing
 import content uses nothing
@@ -16,7 +17,10 @@ return "site.db"
 configured
 }
 
-fn schema() -> List[Text] {
+note "The schema version this code expects; `PRAGMA user_version` holds the version of the file."
+fn current_version() -> Int = 2
+
+fn schema_v1() -> List[Text] {
 [
 "CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)",
 "CREATE TABLE IF NOT EXISTS pages (slug TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', nav_label TEXT NOT NULL DEFAULT '', nav_order INTEGER NOT NULL DEFAULT 0, published INTEGER NOT NULL DEFAULT 1)",
@@ -26,29 +30,44 @@ fn schema() -> List[Text] {
 ]
 }
 
-fn text_of(row: Map[Text, Text], name: Text) -> Text = value_or(get(row, name), "")
-
-fn count_of(rows: List[Map[Text, Text]], name: Text) -> Int {
-if length(rows) == 0 {
-return 0
+note "Version 2: the login sessions of the admin pages and the admin's own state (session secret, 2FA). Sessions are stored by the SHA-256 of their token, so the database alone does not let anyone in."
+fn schema_v2() -> List[Text] {
+[
+"CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, stage TEXT NOT NULL, created INTEGER NOT NULL, expires INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)",
+"CREATE TABLE IF NOT EXISTS admin_state (name TEXT PRIMARY KEY, value TEXT NOT NULL)"
+]
 }
-value_or(parse_int(text_of(rows[0], name)), 0)
+
+pub fn text_of(row: Map[Text, Text], name: Text) -> Text = value_or(get(row, name), "")
+
+pub fn number_of(row: Map[Text, Text], name: Text) -> Int = value_or(parse_int(text_of(row, name)), 0)
+
+fn first_number(rows: List[Map[Text, Text]], name: Text) -> Int = if length(rows) == 0 { 0 } else { number_of(rows[0], name) }
+
+fn version_of(connection: Database) -> Result[Int, Text] uses db {
+let rows = try db_query(connection, "PRAGMA user_version", [])
+.Ok(first_number(rows, "user_version"))
 }
 
-note "Opens the database and makes sure it is ready: on a new or empty database the tables are created and the initial content is written, in one transaction. Workers that start at the same moment wait for each other, and the second one finds the work done."
+note "Opens the database and makes sure it is ready. On a new database the tables are created and the initial content is written; an older database is upgraded. Both happen in one transaction, so workers that start at the same moment wait for each other, and the second one finds the work done."
 pub fn open() -> Result[Database, Text] uses db, env, random {
 let connection = try db_open(database_path())
-let rows = try db_query(connection, "PRAGMA user_version", [])
-if count_of(rows, "user_version") < 1 {
-try prepare(connection)
+if try version_of(connection) < current_version() {
+try in_transaction(connection, upgrade)
 }
 .Ok(connection)
 }
 
-fn prepare(connection: Database) -> Result[Unit, Text] uses db, random {
+note "One statement and its parameters, for `run_all`."
+pub type Step {
+sql: Text
+params: List[Text]
+}
+
+note "Runs `work` between BEGIN IMMEDIATE and COMMIT, and rolls back when it fails."
+pub fn in_transaction(connection: Database, work: fn(Database) -> Result[Unit, Text] uses db, random) -> Result[Unit, Text] uses db, random {
 let _ = try db_execute(connection, "BEGIN IMMEDIATE", [])
-let outcome = build(connection)
-match outcome {
+match work(connection) {
 .Ok(_) => {}
 .Error(message) => {
 let _ = db_execute(connection, "ROLLBACK", [])
@@ -59,19 +78,46 @@ let _ = try db_execute(connection, "COMMIT", [])
 .Ok(())
 }
 
-fn build(connection: Database) -> Result[Unit, Text] uses db, random {
-for statement in schema() {
-let _ = try db_execute(connection, statement, [])
+fn execute_all(connection: Database, steps: List[Step]) -> Result[Unit, Text] uses db {
+for item in steps {
+let _ = try db_execute(connection, item.sql, item.params)
 }
-let existing = try db_query(connection, "SELECT COUNT(*) AS n FROM pages", [])
-if count_of(existing, "n") == 0 {
-try seed(connection)
-}
-let salt = hex_encode(random_bytes(16))
-let _ = try db_execute(connection, "INSERT OR IGNORE INTO settings (name, value) VALUES ('stats_salt', ?1)", [salt])
-let _ = try db_execute(connection, "PRAGMA user_version = 1", [])
 .Ok(())
 }
+
+note "Runs the statements in one transaction: all of them, or none."
+pub fn run_all(connection: Database, steps: List[Step]) -> Result[Unit, Text] uses db {
+let _ = try db_execute(connection, "BEGIN IMMEDIATE", [])
+match execute_all(connection, steps) {
+.Ok(_) => {}
+.Error(message) => {
+let _ = db_execute(connection, "ROLLBACK", [])
+return .Error(message)
+}
+}
+let _ = try db_execute(connection, "COMMIT", [])
+.Ok(())
+}
+
+fn upgrade(connection: Database) -> Result[Unit, Text] uses db, random {
+let version = try version_of(connection)
+if version < 1 {
+try execute_all(connection, map(schema_v1(), plain))
+let existing = try db_query(connection, "SELECT COUNT(*) AS n FROM pages", [])
+if first_number(existing, "n") == 0 {
+try seed(connection)
+}
+let _ = try db_execute(connection, "INSERT OR IGNORE INTO settings (name, value) VALUES ('stats_salt', ?1)", [hex_encode(random_bytes(16))])
+}
+if version < 2 {
+try execute_all(connection, map(schema_v2(), plain))
+let _ = try db_execute(connection, "INSERT OR IGNORE INTO admin_state (name, value) VALUES ('session_secret', ?1)", [hex_encode(random_bytes(32))])
+}
+let _ = try db_execute(connection, "PRAGMA user_version = \(current_version())", [])
+.Ok(())
+}
+
+fn plain(sql: Text) -> Step = Step { sql: sql, params: [] }
 
 fn seed(connection: Database) -> Result[Unit, Text] uses db {
 for entry in content.settings() {
@@ -90,12 +136,12 @@ let _ = try db_execute(connection, "INSERT OR IGNORE INTO blocks (page_slug, sor
 
 // ---------- reading the site ----------
 
-fn page_from(row: Map[Text, Text]) -> model.Page {
-model.Page { slug: text_of(row, "slug"), title: text_of(row, "title"), description: text_of(row, "description"), nav_label: text_of(row, "nav_label"), nav_order: value_or(parse_int(text_of(row, "nav_order")), 0) }
+pub fn page_from(row: Map[Text, Text]) -> model.Page {
+model.Page { slug: text_of(row, "slug"), title: text_of(row, "title"), description: text_of(row, "description"), nav_label: text_of(row, "nav_label"), nav_order: number_of(row, "nav_order"), published: text_of(row, "published") != "0" }
 }
 
-fn block_from(row: Map[Text, Text]) -> model.Block {
-model.Block { kind: text_of(row, "kind"), heading: text_of(row, "heading"), body: text_of(row, "body"), extra: text_of(row, "extra") }
+pub fn block_from(row: Map[Text, Text]) -> model.Block {
+model.Block { id: number_of(row, "id"), kind: text_of(row, "kind"), heading: text_of(row, "heading"), body: text_of(row, "body"), extra: text_of(row, "extra") }
 }
 
 pub fn load_settings(connection: Database) -> Map[Text, Text] uses db {
@@ -107,22 +153,29 @@ set found = put(found, text_of(row, "name"), text_of(row, "value"))
 found
 }
 
-pub fn find_page(connection: Database, slug: Text) -> Option[model.Page] uses db {
-let rows = db_query(connection, "SELECT slug, title, description, nav_label, nav_order FROM pages WHERE slug = ?1 AND published = 1", [slug]) else return .None
-if length(rows) == 0 {
-return .None
-}
-.Some(page_from(rows[0]))
+note "A published page and the menu."
+pub type Site {
+page: Option[model.Page]
+navigation: List[model.Page]
 }
 
-note "The pages that appear in the menu, in menu order. A page with nav_order 0 is reachable but not listed."
-pub fn navigation(connection: Database) -> List[model.Page] uses db {
-let rows = db_query(connection, "SELECT slug, title, description, nav_label, nav_order FROM pages WHERE published = 1 AND nav_order > 0 ORDER BY nav_order, slug", []) else return []
-map(rows, page_from)
+fn in_menu(entry: model.Page) -> Bool = entry.nav_order > 0
+
+note "The published page `slug` and the menu (published pages with nav_order > 0, in menu order), read with one query. A page with nav_order 0 is reachable but not listed."
+pub fn site_pages(connection: Database, slug: Text) -> Site uses db {
+let rows = db_query(connection, "SELECT slug, title, description, nav_label, nav_order, published FROM pages WHERE published = 1 AND (nav_order > 0 OR slug = ?1) ORDER BY nav_order, slug", [slug]) else return Site { page: .None, navigation: [] }
+let found = map(rows, page_from)
+var current: Option[model.Page] = .None
+for entry in found {
+if entry.slug == slug {
+set current = .Some(entry)
+}
+}
+Site { page: current, navigation: filter(found, in_menu) }
 }
 
 pub fn page_blocks(connection: Database, slug: Text) -> List[model.Block] uses db {
-let rows = db_query(connection, "SELECT kind, heading, body, extra FROM blocks WHERE page_slug = ?1 ORDER BY sort_order", [slug]) else return []
+let rows = db_query(connection, "SELECT id, kind, heading, body, extra FROM blocks WHERE page_slug = ?1 ORDER BY sort_order", [slug]) else return []
 map(rows, block_from)
 }
 

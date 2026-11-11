@@ -26,12 +26,13 @@ RUN find /tessera -name '*.tes' -exec sed -i 's/\r$//' {} + \
  && cd /tessera \
  && tessera-seed build stage1/main.tes -o /usr/local/bin/tessera1
 
-# 2. nginx with the Tessera module, built the way hosts/test/run_server_tests.sh builds it (with thread support).
+# 2. nginx with the Tessera module, built the way hosts/test/run_server_tests.sh builds it (with thread support),
+#    plus gzip for the static assets.
 RUN curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" | tar xz -C /tmp \
  && cd "/tmp/nginx-${NGINX_VERSION}" \
  && ./configure \
       --prefix=/opt/nginx \
-      --without-http_rewrite_module --without-http_gzip_module \
+      --without-http_rewrite_module \
       --http-client-body-temp-path=/tmp/nginx/client_body \
       --http-proxy-temp-path=/tmp/nginx/proxy \
       --http-fastcgi-temp-path=/tmp/nginx/fastcgi \

@@ -6,9 +6,12 @@ title: Text
 description: Text
 nav_label: Text
 nav_order: Int
+published: Bool
 }
 
+note "`id` is the database row; 0 for blocks that are not stored yet (the seed content)."
 pub type Block {
+id: Int
 kind: Text
 heading: Text
 body: Text
@@ -24,3 +27,30 @@ pub type SeedPage {
 page: Page
 blocks: List[Block]
 }
+
+note "What a block kind is for, and what its three fields mean; shown in the page editor."
+pub type Kind {
+name: Text
+heading: Text
+body: Text
+extra: Text
+}
+
+note "The block kinds view.tes can render, in the order the editor offers them."
+pub fn kinds() -> List[Kind] {
+[
+Kind { name: "section", heading: "Heading (optional)", body: "Paragraphs; a blank line starts a new one", extra: "Not used" },
+Kind { name: "hero", heading: "Large title", body: "Lead text", extra: "Buttons, one per line: label|url (the first is the primary button)" },
+Kind { name: "banner", heading: "Page title", body: "Lead text", extra: "Not used" },
+Kind { name: "cards", heading: "Heading", body: "Intro text", extra: "Cards, one per line: title|text|optional url" },
+Kind { name: "steps", heading: "Heading", body: "Intro text", extra: "Steps, one per line: title|text" },
+Kind { name: "list", heading: "Heading", body: "Intro text", extra: "Items, one per line" },
+Kind { name: "code", heading: "Heading (optional)", body: "Code, shown as written", extra: "Caption, e.g. a file name; .tes files are highlighted" },
+Kind { name: "callout", heading: "Label (optional)", body: "Paragraphs", extra: "Not used" },
+Kind { name: "cta", heading: "Heading", body: "Paragraphs", extra: "Buttons, one per line: label|url" }
+]
+}
+
+fn kind_name(kind: Kind) -> Text = kind.name
+
+pub fn is_kind(name: Text) -> Bool = contains(map(kinds(), kind_name), name)

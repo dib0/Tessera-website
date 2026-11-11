@@ -14,7 +14,7 @@ mkdir -p "$data"
 chown -R tessera:tessera "$data" || echo "warning: cannot chown $data; it must be writable by user 'tessera'" >&2
 
 if [ -z "${ADMIN_USER:-}" ] || [ -z "${ADMIN_PASSWORD:-}" ]; then
-    echo "warning: ADMIN_USER and ADMIN_PASSWORD are not both set; the admin page is disabled" >&2
+    echo "warning: ADMIN_USER and ADMIN_PASSWORD are not both set; the admin pages are disabled" >&2
 fi
 
 exec /opt/nginx/sbin/nginx -c /etc/nginx/nginx.conf -g 'daemon off;'
