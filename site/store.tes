@@ -1,8 +1,14 @@
-// The SQLite side of the site: the schema and its upgrades, the first-run seeding, and the queries behind the pages.
+// The SQLite side of the site: the schema and its upgrades, writing `content` into the database, and the queries
+// behind the pages.
 //
 // The database holds the texts and the page structure (settings, pages, blocks), the statistics (hits) and the
-// admin state (sessions, admin_state). When the database is empty, `open` fills it from `content`; from then on the
-// database is the only source, edited through the admin pages.
+// admin state (sessions, admin_state). `content` is written into it on the first request, and again whenever the
+// deployed content.tes has changed, which is how new text reaches a site that is already running.
+//
+// Hand edits win. The `seeded` table remembers the value `content` last wrote for every field, which tells the two
+// apart: a field that still holds what content wrote was not touched by anyone and is updated, anything else was
+// typed on the admin pages and is left alone. Pages and blocks added on the admin pages have no seed at all, so
+// they are never changed or removed.
 
 import model uses nothing
 import content uses nothing
@@ -18,7 +24,7 @@ configured
 }
 
 note "The schema version this code expects; `PRAGMA user_version` holds the version of the file."
-fn current_version() -> Int = 2
+fn current_version() -> Int = 3
 
 fn schema_v1() -> List[Text] {
 [
@@ -38,6 +44,13 @@ fn schema_v2() -> List[Text] {
 ]
 }
 
+note "Version 3: what `content` last wrote, per field, so that a later version of content.tes can be applied without overwriting text that was changed on the admin pages. `kind` is `setting`, `page`, `block` or `meta`."
+fn schema_v3() -> List[Text] {
+[
+"CREATE TABLE IF NOT EXISTS seeded (kind TEXT NOT NULL, name TEXT NOT NULL, field TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (kind, name, field))"
+]
+}
+
 pub fn text_of(row: Map[Text, Text], name: Text) -> Text = value_or(get(row, name), "")
 
 pub fn number_of(row: Map[Text, Text], name: Text) -> Int = value_or(parse_int(text_of(row, name)), 0)
@@ -49,13 +62,22 @@ let rows = try db_query(connection, "PRAGMA user_version", [])
 .Ok(first_number(rows, "user_version"))
 }
 
-note "Opens the database and makes sure it is ready. On a new database the tables are created and the initial content is written; an older database is upgraded. Both happen in one transaction, so workers that start at the same moment wait for each other, and the second one finds the work done."
+note "Opens the database and makes sure it is ready: an older file is upgraded, and when the deployed content.tes differs from what was written last time, it is applied. Both happen in one transaction, so workers that start at the same moment wait for each other and the second one finds the work done. On an unchanged site this costs one extra query and one fingerprint, no writes."
 pub fn open() -> Result[Database, Text] uses db, env, random {
 let connection = try db_open(database_path())
+try prepare(connection)
+.Ok(connection)
+}
+
+note "Brings a connection up to date: the tables of a newer schema, and `content` when the deployed content.tes differs from what was written last time. Separate from `open` so that a test can use an in-memory database."
+pub fn prepare(connection: Database) -> Result[Unit, Text] uses db, random {
 if try version_of(connection) < current_version() {
 try in_transaction(connection, upgrade)
 }
-.Ok(connection)
+if try content_changed(connection) {
+try apply_content(connection)
+}
+.Ok(())
 }
 
 note "One statement and its parameters, for `run_all`."
@@ -99,19 +121,19 @@ let _ = try db_execute(connection, "COMMIT", [])
 .Ok(())
 }
 
+note "Creates the tables of every version the file does not have yet. The content itself is not written here; `apply_content` does that for a new and for an existing database alike."
 fn upgrade(connection: Database) -> Result[Unit, Text] uses db, random {
 let version = try version_of(connection)
 if version < 1 {
 try execute_all(connection, map(schema_v1(), plain))
-let existing = try db_query(connection, "SELECT COUNT(*) AS n FROM pages", [])
-if first_number(existing, "n") == 0 {
-try seed(connection)
-}
 let _ = try db_execute(connection, "INSERT OR IGNORE INTO settings (name, value) VALUES ('stats_salt', ?1)", [hex_encode(random_bytes(16))])
 }
 if version < 2 {
 try execute_all(connection, map(schema_v2(), plain))
 let _ = try db_execute(connection, "INSERT OR IGNORE INTO admin_state (name, value) VALUES ('session_secret', ?1)", [hex_encode(random_bytes(32))])
+}
+if version < 3 {
+try execute_all(connection, map(schema_v3(), plain))
 }
 let _ = try db_execute(connection, "PRAGMA user_version = \(current_version())", [])
 .Ok(())
@@ -119,19 +141,267 @@ let _ = try db_execute(connection, "PRAGMA user_version = \(current_version())",
 
 fn plain(sql: Text) -> Step = Step { sql: sql, params: [] }
 
-fn seed(connection: Database) -> Result[Unit, Text] uses db {
+// ---------- writing content into the database ----------
+
+note "What the seed of one field is called. The three parts cannot be confused with one another: a setting name, a page slug and a sort order are all free of the separator."
+fn seed_key(kind: Text, name: Text, field: Text) -> Text = "\(kind)|\(name)|\(field)"
+
+fn block_name(slug: Text, index: Int) -> Text = "\(slug)#\(index)"
+
+note "A fingerprint of everything `content` holds. It changes when any text, any block or the page structure changes, and comparing it with the stored one is how a running site notices that a new version was deployed. Every field goes in, separated by a character that cannot occur in the content itself."
+pub fn content_fingerprint() -> Text {
+var parts: List[Text] = []
 for entry in content.settings() {
-let _ = try db_execute(connection, "INSERT OR IGNORE INTO settings (name, value) VALUES (?1, ?2)", [entry.name, entry.value])
+set parts += [entry.name, entry.value]
 }
 for seeded in content.pages() {
 let details = seeded.page
-let _ = try db_execute(connection, "INSERT OR IGNORE INTO pages (slug, title, description, nav_label, nav_order) VALUES (?1, ?2, ?3, ?4, ?5)", [details.slug, details.title, details.description, details.nav_label, to_text(details.nav_order)])
-for index in range(0, length(seeded.blocks)) {
-let item = seeded.blocks[index]
-let _ = try db_execute(connection, "INSERT OR IGNORE INTO blocks (page_slug, sort_order, kind, heading, body, extra) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", [details.slug, to_text(index), item.kind, item.heading, item.body, item.extra])
+set parts += [details.slug, details.title, details.description, details.nav_label, to_text(details.nav_order)]
+for item in seeded.blocks {
+set parts += [item.kind, item.heading, item.body, item.extra]
 }
 }
-.Ok(())
+hex_encode(sha256(to_bytes(join(parts, "\u{1F}"))))
+}
+
+fn content_changed(connection: Database) -> Result[Bool, Text] uses db {
+let rows = try db_query(connection, "SELECT value FROM seeded WHERE kind = 'meta' AND name = 'content' AND field = 'fingerprint'", [])
+if length(rows) == 0 {
+return .Ok(true)
+}
+.Ok(text_of(rows[0], "value") != content_fingerprint())
+}
+
+fn seed_step(kind: Text, name: Text, field: Text, value: Text) -> Step {
+Step { sql: "INSERT OR REPLACE INTO seeded (kind, name, field, value) VALUES (?1, ?2, ?3, ?4)", params: [kind, name, field, value] }
+}
+
+fn forget_step(kind: Text, name: Text) -> Step {
+Step { sql: "DELETE FROM seeded WHERE kind = ?1 AND name = ?2", params: [kind, name] }
+}
+
+note "Whether `content` may write this field: it never wrote it before, or the database still holds exactly what it wrote last time. A value that differs was changed on the admin pages and stays."
+pub fn content_owns(seeds: Map[Text, Text], kind: Text, name: Text, field: Text, live: Text) -> Bool {
+match get(seeds, seed_key(kind, name, field)) {
+.Some(previous) => previous == live
+.None => true
+}
+}
+
+note "The steps that bring one field in line: the update itself when the value really differs, and the new seed. Nothing at all when the field was changed by hand, or when it is already right."
+fn field_steps(seeds: Map[Text, Text], kind: Text, name: Text, field: Text, live: Text, wanted: Text, update: Step) -> List[Step] {
+if not content_owns(seeds, kind, name, field, live) {
+return []
+}
+if live == wanted and get(seeds, seed_key(kind, name, field)) == .Some(wanted) {
+return []
+}
+var steps: List[Step] = []
+if live != wanted {
+set steps += [update]
+}
+steps + [seed_step(kind, name, field, wanted)]
+}
+
+fn setting_steps(seeds: Map[Text, Text], live: Map[Text, Text], entry: model.Setting) -> List[Step] {
+let update = Step { sql: "INSERT OR REPLACE INTO settings (name, value) VALUES (?1, ?2)", params: [entry.name, entry.value] }
+match get(live, entry.name) {
+.Some(current) => field_steps(seeds, "setting", entry.name, "value", current, entry.value, update)
+.None => [update, seed_step("setting", entry.name, "value", entry.value)]
+}
+}
+
+fn new_page_steps(wanted: model.Page) -> List[Step] {
+[
+Step { sql: "INSERT INTO pages (slug, title, description, nav_label, nav_order, published) VALUES (?1, ?2, ?3, ?4, ?5, 1)", params: [wanted.slug, wanted.title, wanted.description, wanted.nav_label, to_text(wanted.nav_order)] },
+seed_step("page", wanted.slug, "title", wanted.title),
+seed_step("page", wanted.slug, "description", wanted.description),
+seed_step("page", wanted.slug, "nav_label", wanted.nav_label),
+seed_step("page", wanted.slug, "nav_order", to_text(wanted.nav_order))
+]
+}
+
+note "`published` is deliberately not managed: a page hidden on the admin pages stays hidden, whatever content.tes says."
+fn page_steps(seeds: Map[Text, Text], current: model.Page, wanted: model.Page) -> List[Step] {
+let slug = wanted.slug
+var steps: List[Step] = []
+set steps += field_steps(seeds, "page", slug, "title", current.title, wanted.title, Step { sql: "UPDATE pages SET title = ?1 WHERE slug = ?2", params: [wanted.title, slug] })
+set steps += field_steps(seeds, "page", slug, "description", current.description, wanted.description, Step { sql: "UPDATE pages SET description = ?1 WHERE slug = ?2", params: [wanted.description, slug] })
+set steps += field_steps(seeds, "page", slug, "nav_label", current.nav_label, wanted.nav_label, Step { sql: "UPDATE pages SET nav_label = ?1 WHERE slug = ?2", params: [wanted.nav_label, slug] })
+set steps += field_steps(seeds, "page", slug, "nav_order", to_text(current.nav_order), to_text(wanted.nav_order), Step { sql: "UPDATE pages SET nav_order = ?1 WHERE slug = ?2", params: [to_text(wanted.nav_order), slug] })
+steps
+}
+
+fn new_block_steps(slug: Text, index: Int, wanted: model.Block) -> List[Step] {
+let name = block_name(slug, index)
+[
+Step { sql: "INSERT INTO blocks (page_slug, sort_order, kind, heading, body, extra) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params: [slug, to_text(index), wanted.kind, wanted.heading, wanted.body, wanted.extra] },
+seed_step("block", name, "kind", wanted.kind),
+seed_step("block", name, "heading", wanted.heading),
+seed_step("block", name, "body", wanted.body),
+seed_step("block", name, "extra", wanted.extra)
+]
+}
+
+fn block_steps(seeds: Map[Text, Text], slug: Text, index: Int, current: model.Block, wanted: model.Block) -> List[Step] {
+let name = block_name(slug, index)
+let id = to_text(current.id)
+var steps: List[Step] = []
+set steps += field_steps(seeds, "block", name, "kind", current.kind, wanted.kind, Step { sql: "UPDATE blocks SET kind = ?1 WHERE id = ?2", params: [wanted.kind, id] })
+set steps += field_steps(seeds, "block", name, "heading", current.heading, wanted.heading, Step { sql: "UPDATE blocks SET heading = ?1 WHERE id = ?2", params: [wanted.heading, id] })
+set steps += field_steps(seeds, "block", name, "body", current.body, wanted.body, Step { sql: "UPDATE blocks SET body = ?1 WHERE id = ?2", params: [wanted.body, id] })
+set steps += field_steps(seeds, "block", name, "extra", current.extra, wanted.extra, Step { sql: "UPDATE blocks SET extra = ?1 WHERE id = ?2", params: [wanted.extra, id] })
+steps
+}
+
+fn seed_matches(seeds: Map[Text, Text], kind: Text, name: Text, field: Text, value: Text) -> Bool {
+get(seeds, seed_key(kind, name, field)) == .Some(value)
+}
+
+note "Whether every field of a block is still what `content` wrote, so that removing it from content.tes may remove it from the site as well. A block with no seed at all was added on the admin pages, has no match, and is kept."
+fn block_untouched(seeds: Map[Text, Text], name: Text, current: model.Block) -> Bool {
+if not seed_matches(seeds, "block", name, "kind", current.kind) {
+return false
+}
+if not seed_matches(seeds, "block", name, "heading", current.heading) {
+return false
+}
+if not seed_matches(seeds, "block", name, "body", current.body) {
+return false
+}
+seed_matches(seeds, "block", name, "extra", current.extra)
+}
+
+fn drop_block_steps(slug: Text, index: Int, current: model.Block) -> List[Step] {
+[
+Step { sql: "DELETE FROM blocks WHERE id = ?1", params: [to_text(current.id)] },
+forget_step("block", block_name(slug, index))
+]
+}
+
+note "Brings the blocks of one page in line with content.tes: existing positions are updated, missing ones added, and positions content no longer has are removed when nothing was typed over them."
+fn page_block_steps(seeds: Map[Text, Text], slug: Text, live: List[model.Block], wanted: List[model.Block]) -> List[Step] {
+var steps: List[Step] = []
+for index in range(0, length(wanted)) {
+if index < length(live) {
+set steps += block_steps(seeds, slug, index, live[index], wanted[index])
+} else {
+set steps += new_block_steps(slug, index, wanted[index])
+}
+}
+for index in range(length(wanted), length(live)) {
+if block_untouched(seeds, block_name(slug, index), live[index]) {
+set steps += drop_block_steps(slug, index, live[index])
+}
+}
+steps
+}
+
+fn page_untouched(seeds: Map[Text, Text], current: model.Page) -> Bool {
+let slug = current.slug
+if not seed_matches(seeds, "page", slug, "title", current.title) {
+return false
+}
+if not seed_matches(seeds, "page", slug, "description", current.description) {
+return false
+}
+if not seed_matches(seeds, "page", slug, "nav_label", current.nav_label) {
+return false
+}
+seed_matches(seeds, "page", slug, "nav_order", to_text(current.nav_order))
+}
+
+fn all_blocks_untouched(seeds: Map[Text, Text], slug: Text, live: List[model.Block]) -> Bool {
+for index in range(0, length(live)) {
+if not block_untouched(seeds, block_name(slug, index), live[index]) {
+return false
+}
+}
+true
+}
+
+note "A page that `content` made and no longer has is removed, with its blocks, but only when neither the page nor any of its blocks was changed by hand. A page made on the admin pages has no seed and is never removed."
+fn drop_page_steps(seeds: Map[Text, Text], slug: Text, current: model.Page, live: List[model.Block]) -> List[Step] {
+if not page_untouched(seeds, current) or not all_blocks_untouched(seeds, slug, live) {
+return []
+}
+var steps: List[Step] = []
+for index in range(0, length(live)) {
+set steps += [forget_step("block", block_name(slug, index))]
+}
+steps + [
+Step { sql: "DELETE FROM blocks WHERE page_slug = ?1", params: [slug] },
+Step { sql: "DELETE FROM pages WHERE slug = ?1", params: [slug] },
+forget_step("page", slug)
+]
+}
+
+fn wanted_slugs() -> List[Text] {
+var slugs: List[Text] = []
+for seeded in content.pages() {
+set slugs += [seeded.page.slug]
+}
+slugs
+}
+
+note "Writes `content` into the database, keeping everything that was changed on the admin pages. Everything happens in one transaction: the whole new version of the site appears at once, or none of it does."
+pub fn apply_content(connection: Database) -> Result[Unit, Text] uses db {
+let seeds = load_seeds(connection)
+let live_settings = load_settings(connection)
+var steps: List[Step] = []
+for entry in content.settings() {
+set steps += setting_steps(seeds, live_settings, entry)
+}
+for seeded in content.pages() {
+let wanted = seeded.page
+match stored_page(connection, wanted.slug) {
+.Some(current) => {
+set steps += page_steps(seeds, current, wanted)
+set steps += page_block_steps(seeds, wanted.slug, page_blocks(connection, wanted.slug), seeded.blocks)
+}
+.None => {
+set steps += new_page_steps(wanted)
+set steps += page_block_steps(seeds, wanted.slug, [], seeded.blocks)
+}
+}
+}
+let keep = wanted_slugs()
+for current in seeded_pages(connection, seeds) {
+if not contains(keep, current.slug) {
+set steps += drop_page_steps(seeds, current.slug, current, page_blocks(connection, current.slug))
+}
+}
+set steps += [seed_step("meta", "content", "fingerprint", content_fingerprint())]
+run_all(connection, steps)
+}
+
+fn load_seeds(connection: Database) -> Map[Text, Text] uses db {
+var found: Map[Text, Text] = [:]
+let rows = db_query(connection, "SELECT kind, name, field, value FROM seeded", []) else return found
+for row in rows {
+set found = put(found, seed_key(text_of(row, "kind"), text_of(row, "name"), text_of(row, "field")), text_of(row, "value"))
+}
+found
+}
+
+fn stored_page(connection: Database, slug: Text) -> Option[model.Page] uses db {
+let rows = db_query(connection, "SELECT slug, title, description, nav_label, nav_order, published FROM pages WHERE slug = ?1", [slug]) else return .None
+if length(rows) == 0 {
+return .None
+}
+.Some(page_from(rows[0]))
+}
+
+note "The pages that `content` made, whether or not it still has them."
+fn seeded_pages(connection: Database, seeds: Map[Text, Text]) -> List[model.Page] uses db {
+let rows = db_query(connection, "SELECT slug, title, description, nav_label, nav_order, published FROM pages ORDER BY slug", []) else return []
+var found: List[model.Page] = []
+for current in map(rows, page_from) {
+if get(seeds, seed_key("page", current.slug, "title")) != .None {
+set found += [current]
+}
+}
+found
 }
 
 // ---------- reading the site ----------
@@ -172,6 +442,12 @@ set current = .Some(entry)
 }
 }
 Site { page: current, navigation: filter(found, in_menu) }
+}
+
+note "Every published page except the error page, in menu order, for the index at /llms.txt. The home page has nav_order 0 and so comes first."
+pub fn listed_pages(connection: Database) -> List[model.Page] uses db {
+let rows = db_query(connection, "SELECT slug, title, description, nav_label, nav_order, published FROM pages WHERE published = 1 AND slug <> '404' ORDER BY nav_order, slug", []) else return []
+map(rows, page_from)
 }
 
 pub fn page_blocks(connection: Database, slug: Text) -> List[model.Block] uses db {

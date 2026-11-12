@@ -234,3 +234,54 @@ let title = if current.slug == "home" { "\(name): \(setting(site, "tagline", "")
 let inner = "\(header_html(site, navigation, current.slug))\n<main id='main'>\n\(join(map(items, block_html), "\n"))\n</main>\n\(footer_html(site))"
 shell(site, title, current.description, "index, follow", inner)
 }
+
+// ---------- the index at /llms.txt ----------
+
+note "One link line of the index: a label, where it is, and what it holds."
+fn entry(label: Text, target: Text, about: Text) -> Text {
+if about == "" {
+return "- [\(label)](\(target))"
+}
+"- [\(label)](\(target)): \(about)"
+}
+
+fn page_entry(origin: Text, current: model.Page) -> Text {
+let label = if current.nav_label == "" { current.title } else { current.nav_label }
+entry(label, "\(origin)\(page_url(current.slug))", current.description)
+}
+
+note "The index a language model is pointed at (https://llmstxt.org): the site in one short file, built from the same pages the menu is built from, so it cannot fall behind the site it describes. `origin` is the scheme and host, or empty for links relative to the site root."
+pub fn llms_index(site: Map[Text, Text], pages: List[model.Page], origin: Text) -> Text {
+let name = setting(site, "site_name", "Tessera")
+let github = setting(site, "github_url", "https://github.com/dib0/Tessera-language")
+var lines = [
+"# \(name)",
+"",
+"> \(setting(site, "tagline", "")). \(setting(site, "footer_text", ""))",
+"",
+"To write Tessera, read the language reference first: it is the whole language in one file, and it is the same text the measurement harness gives a model.",
+"",
+"## Docs",
+"",
+entry("Language reference", "\(origin)/llms-full.txt", "the complete language in one file: types, effects, syntax, the standard library, the diagnostics and the runtime errors")
+]
+for current in pages {
+set lines += [page_entry(origin, current)]
+}
+set lines += [
+"",
+"## Source",
+"",
+entry("Repository", github, "specification, both compilers, runtime, standard modules, measurement harness and examples"),
+entry("Specification", "\(github)/blob/main/language-design.md", "the authoritative description of the language; where the compiler and the specification disagree, the specification wins"),
+entry("Examples", "\(github)/tree/main/examples", "complete programs, from a few lines to a game"),
+entry("Standard modules", "\(github)/tree/main/std", "the modules that ship with the compiler, written in Tessera"),
+"",
+"## Optional",
+"",
+entry("Measurement harness", "\(github)/tree/main/harness", "the tasks, the variants and the method behind the design decisions"),
+entry("Hosting guide", "\(github)/blob/main/hosts/README.md", "running a Tessera web application as CGI, FastCGI, a server, or a module inside nginx, Apache or IIS"),
+""
+]
+join(lines, "\n")
+}

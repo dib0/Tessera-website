@@ -63,6 +63,24 @@ http.html(404, view.document(site, found.navigation, current, store.page_blocks(
 
 fn unavailable() -> http.Response = http.text(503, "the site database is unavailable\n")
 
+note "Where this site is, as a language model should write it down: taken from the host the request came in on, over https unless it is a local address. Empty when there is no host header, and then the index links relative to the site root."
+fn origin_of(request: http.Request) -> Text {
+let host = value_or(http.header(request, "host"), "")
+if host == "" {
+return ""
+}
+let forwarded = to_lower(value_or(http.header(request, "x-forwarded-proto"), ""))
+let local = starts_with(host, "localhost") or starts_with(host, "127.0.0.1") or starts_with(host, "[::1]")
+let scheme = if forwarded != "" { forwarded } else if local { "http" } else { "https" }
+"\(scheme)://\(host)"
+}
+
+note "The index at /llms.txt, built from the pages in the database. /llms-full.txt is the language reference itself and is served next to it as a static file."
+fn llms_response(connection: Database, site: Map[Text, Text], request: http.Request) -> http.Response uses db, time {
+remember(connection, site, request, 200)
+http.text(200, view.llms_index(site, store.listed_pages(connection), origin_of(request)))
+}
+
 fn handle(request: http.Request) -> http.Response uses db, env, log, random, time {
 let path = request.path
 if path == "/healthz" {
@@ -76,6 +94,10 @@ return http.with_header(http.text(405, "method not allowed\n"), "allow", "GET, H
 }
 if path == "/robots.txt" {
 return http.text(200, "User-agent: *\nDisallow: /admin\n")
+}
+if path == "/llms.txt" {
+let connection = store.open() else return unavailable()
+return llms_response(connection, store.load_settings(connection), request)
 }
 let slug = slug_of(path)
 if slug == "home" and path != "/" {
@@ -239,4 +261,123 @@ let item = model.Block { id: 1, kind: kind.name, heading: "H", body: "B", extra:
 let details = model.Page { slug: "k", title: "K", description: "", nav_label: "", nav_order: 0, published: true }
 assert(contains(view.document([:], [], details, [item]), "<section"))
 }
+}
+
+// ---------- tests for writing content into a database that is already running ----------
+
+note "A private in-memory database with the schema and the content of content.tes in it."
+fn prepared() -> Option[Database] uses db, random {
+let connection = db_open(":memory:") else return .None
+if not ready(connection) {
+return .None
+}
+.Some(connection)
+}
+
+note "`prepare` answers with `Result[Unit, Text]`, which cannot be bound to a name; a test wants a plain yes or no."
+fn ready(connection: Database) -> Bool uses db, random {
+match store.prepare(connection) {
+.Ok(_) => true
+.Error(_) => false
+}
+}
+
+fn one_text(connection: Database, sql: Text, params: List[Text]) -> Text uses db {
+let rows = db_query(connection, sql, params) else return ""
+if length(rows) == 0 {
+return ""
+}
+store.text_of(rows[0], "value")
+}
+
+fn body_of(connection: Database, slug: Text, order: Int) -> Text uses db {
+one_text(connection, "SELECT body AS value FROM blocks WHERE page_slug = ?1 AND sort_order = ?2", [slug, to_text(order)])
+}
+
+fn seed_of(connection: Database, name: Text) -> Text uses db {
+one_text(connection, "SELECT value FROM seeded WHERE kind = 'block' AND name = ?1 AND field = 'body'", [name])
+}
+
+note "Forgets the fingerprint, so the next `prepare` believes a new version of content.tes was deployed."
+fn pretend_new_content(connection: Database) -> Unit uses db {
+let _ = db_execute(connection, "DELETE FROM seeded WHERE kind = 'meta'", [])
+}
+
+test "an empty database is filled from content" {
+let connection = prepared() else return
+let found = store.site_pages(connection, "home")
+let home = found.page else return assert(false)
+assert(home.title == "Home")
+assert(length(store.page_blocks(connection, "home")) > 0)
+assert(length(found.navigation) > 0)
+}
+
+test "preparing twice changes nothing and costs no writes" {
+let connection = prepared() else return
+let before = one_text(connection, "SELECT COUNT(*) AS value FROM blocks", [])
+assert(ready(connection))
+assert(one_text(connection, "SELECT COUNT(*) AS value FROM blocks", []) == before)
+assert(one_text(connection, "SELECT value FROM seeded WHERE kind = 'meta' AND name = 'content' AND field = 'fingerprint'", []) == store.content_fingerprint())
+}
+
+test "a new version of content replaces text nobody touched" {
+let connection = prepared() else return
+let original = body_of(connection, "home", 1)
+assert(original != "")
+// Both the page and the seed say something else, as if that had been the text all along.
+let _ = db_execute(connection, "UPDATE blocks SET body = 'an older sentence' WHERE page_slug = 'home' AND sort_order = 1", [])
+let _ = db_execute(connection, "UPDATE seeded SET value = 'an older sentence' WHERE kind = 'block' AND name = 'home#1' AND field = 'body'", [])
+pretend_new_content(connection)
+assert(ready(connection))
+assert(body_of(connection, "home", 1) == original)
+assert(seed_of(connection, "home#1") == original)
+}
+
+test "a new version of content leaves text that was edited on the admin pages" {
+let connection = prepared() else return
+// Only the page changes; the seed still holds what content wrote, so the two differ.
+let _ = db_execute(connection, "UPDATE blocks SET body = 'written by the admin' WHERE page_slug = 'home' AND sort_order = 1", [])
+pretend_new_content(connection)
+assert(ready(connection))
+assert(body_of(connection, "home", 1) == "written by the admin")
+}
+
+test "a page added on the admin pages survives a new version of content" {
+let connection = prepared() else return
+let _ = db_execute(connection, "INSERT INTO pages (slug, title, description, nav_label, nav_order, published) VALUES ('news', 'News', '', 'News', 0, 1)", [])
+let _ = db_execute(connection, "INSERT INTO blocks (page_slug, sort_order, kind, heading, body, extra) VALUES ('news', 0, 'section', 'Hello', 'Mine', '')", [])
+pretend_new_content(connection)
+assert(ready(connection))
+assert(one_text(connection, "SELECT title AS value FROM pages WHERE slug = 'news'", []) == "News")
+assert(body_of(connection, "news", 0) == "Mine")
+}
+
+test "whether content may write a field is decided by the seed alone" {
+let seeds = ["block|home#1|body": "what content wrote"]
+assert(store.content_owns(seeds, "block", "home#1", "body", "what content wrote"))
+assert(not store.content_owns(seeds, "block", "home#1", "body", "what the admin wrote"))
+assert(store.content_owns(seeds, "block", "home#2", "body", "a block content never wrote"))
+}
+
+test "the index at /llms.txt lists the pages that are really in the database" {
+let connection = prepared() else return
+let site = store.load_settings(connection)
+let index = view.llms_index(site, store.listed_pages(connection), "https://tessera-language.com")
+assert(starts_with(index, "# Tessera\n"))
+assert(contains(index, "(https://tessera-language.com/llms-full.txt)"))
+assert(contains(index, "[Home](https://tessera-language.com/)"))
+assert(contains(index, "[Why](https://tessera-language.com/why)"))
+assert(contains(index, "## Source"))
+// The error page is not a page to read, and nothing links to it.
+assert(not contains(index, "/404"))
+}
+
+fn asking_from(host: Text) -> http.Request {
+http.request("GET", "/llms.txt", "") with { headers: ["host": host] }
+}
+
+test "the index uses the host the request came in on" {
+assert(origin_of(asking_from("example.test")) == "https://example.test")
+assert(origin_of(asking_from("localhost:8080")) == "http://localhost:8080")
+assert(origin_of(http.request("GET", "/llms.txt", "")) == "")
 }

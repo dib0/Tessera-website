@@ -82,8 +82,8 @@ nginx loads `libsite.so` into its workers (`docker/nginx.conf`) and passes `ADMI
 wwwroot/assets/   static files, served by nginx at /assets/ (css/site.css, js/theme.js, js/site.js, img/*.svg)
 site/
   main.tes      handle(): routing, hit recording, and the tests (`tessera1 test site/main.tes`)
-  store.tes     SQLite: schema, first-run seeding in one transaction, queries
-  content.tes   the initial content: settings, pages and blocks (used only when the database is empty)
+  store.tes     SQLite: schema, writing content.tes into the database, queries
+  content.tes   the content: settings, pages and blocks, compiled into the program
   view.tes      blocks -> HTML; everything from the database is escaped
   tracking.tes  anonymous visitor ids, bot and browser detection, referrer host (pure)
   stats.tes     the queries behind the statistics page
@@ -106,10 +106,33 @@ Tables: `settings` (name, value), `pages` (slug, title, description, nav_label, 
 blank line starts a paragraph, `` `code` `` is code and `[label](url)` is a link; list-like blocks keep one item per line
 in `extra`, fields separated by `|`.
 
-When the database is empty (`PRAGMA user_version` is 0), the first request creates the tables and writes `content.tes`
-into them in a single `BEGIN IMMEDIATE` transaction, so workers that start together cannot seed twice. An older database
-is upgraded the same way (version 2 added `sessions` and `admin_state`). After that the database is the only source:
-edit the content on the admin pages. Delete the file to start over from the built-in content.
+The first request creates the tables and writes `content.tes` into them in a single `BEGIN IMMEDIATE` transaction, so
+workers that start together cannot write twice. An older file is upgraded first (version 2 added `sessions` and
+`admin_state`, version 3 added `seeded`).
+
+### Deploying new content over a database that is already running
+
+`content.tes` is not only a first-run seed. Every request compares a fingerprint of the compiled-in content with the
+one stored in the database; when they differ a new version was deployed, and it is written in field by field.
+
+Hand edits win. The `seeded` table remembers the value `content.tes` last wrote for every field, which is what tells
+the two apart:
+
+| In the database | Seed | What happens |
+|---|---|---|
+| what content wrote | the same | nobody touched it: updated to the new text |
+| something else | what content wrote | edited on the admin pages: left alone, for good |
+| no row at all | no row | a page or block made on the admin pages: never touched |
+
+So a page or block you add on the admin pages is safe, and so is any wording you change there. A page or block that
+disappears from `content.tes` is removed only when it, and all of its blocks, are still exactly as content wrote them.
+`published` is never managed, so a page you hide stays hidden.
+
+**Once, when a version 2 database is upgraded**, there are no seeds yet to compare against, so `content.tes` is written
+over every page and block it defines. Wording changed on the admin pages *before* that upgrade is replaced. Pages and
+blocks you added yourself are not affected, and from then on every edit is recognised and kept.
+
+Delete the database file to start over from the built-in content.
 
 ### The admin pages
 
@@ -122,6 +145,19 @@ edit the content on the admin pages. Delete the file to start over from the buil
 | `/admin/account` | Two-factor authentication on and off, and *Log out everywhere*. |
 
 Changing the address of a page moves its blocks with it in one transaction. Block kinds are explained in the editor.
+
+### For language models: /llms.txt and /llms-full.txt
+
+The site publishes itself the way [llmstxt.org](https://llmstxt.org) describes, so that an agent can read about Tessera
+without crawling HTML:
+
+| Path | Where it comes from |
+|---|---|
+| `/llms.txt` | Built by the program from the pages in its database: the site name, the tagline, and every published page with its description. It cannot fall behind the site, because it is made of the site. |
+| `/llms-full.txt` | `harness/reference/tessera.md` from the language repository, written into the image at build time with `docker/llms-full.header.md` in front of it, and served by nginx. The whole language in one file: the same text the measurement harness gives a model. |
+
+A change to the reference in the language repository reaches the site on its next image build; nothing is copied by
+hand, and the two cannot drift apart.
 
 ### Static files and the look
 

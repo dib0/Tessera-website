@@ -52,6 +52,14 @@ RUN find /src/site -name '*.tes' -exec sed -i 's/\r$//' {} + \
  && mkdir -p /opt/tessera \
  && tessera1 build site/main.tes --library -o /opt/tessera/libsite.so
 
+# 4. /llms-full.txt: the language reference, straight from the language repository, with a header saying where it
+#    came from. The site serves it next to /llms.txt, which the program builds from the pages in its database.
+#    Generated here, so the published reference is always the one this image was built against.
+COPY docker/llms-full.header.md /src/docker/llms-full.header.md
+RUN mkdir -p /opt/tessera/public \
+ && { cat /src/docker/llms-full.header.md; tail -n +2 /tessera/harness/reference/tessera.md; } > /opt/tessera/public/llms-full.txt \
+ && sed -i 's/\r$//' /opt/tessera/public/llms-full.txt
+
 # ---------------------------------------------------------------------------------------------------------------
 FROM ${RUNTIME_IMAGE}
 
@@ -65,6 +73,7 @@ RUN apt-get update \
 COPY --from=build /opt/nginx /opt/nginx
 COPY --from=build /opt/tessera/libsite.so /opt/tessera/libsite.so
 COPY wwwroot /opt/tessera/wwwroot
+COPY --from=build /opt/tessera/public/llms-full.txt /opt/tessera/wwwroot/llms-full.txt
 COPY docker/nginx.conf /etc/nginx/nginx.conf
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN sed -i 's/\r$//' /entrypoint.sh /etc/nginx/nginx.conf && chmod 0755 /entrypoint.sh
